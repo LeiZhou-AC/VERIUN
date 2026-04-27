@@ -16,7 +16,7 @@ from pprint import pprint
 
 from configs.data.dataset import UnlearningDataset
 from unlearning.od import ODRUnlearner
-from utils.config import load_config
+from utils.config import load=_config
 from utils.seed import set_seed
 
 
