@@ -1,0 +1,9 @@
+dataset: cifar10
+data_path: datasets
+allow_download: false
+
+batch_size: 64
+lr: 0.001
+epochs: 10
+alpha: 1.0
+"lambda": 0.5
