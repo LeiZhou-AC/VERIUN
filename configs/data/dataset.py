@@ -62,6 +62,8 @@ class UnlearningDataset:
         - dataset: str, one of mnist/svhn/cifar10/cifar100/stl10
         - data_path: str
         - allow_download: bool, whether to download when local data is missing
+        - split_mode: str, `random` or `by_class`
+        - forget_classes: list[int], used when split_mode is `by_class`
         - batch_size: int
         - num_workers: int
         - pin_memory: bool
@@ -80,6 +82,8 @@ class UnlearningDataset:
         self.pin_memory = bool(self.config.get("pin_memory", False))
         self.augmentations = bool(self.config.get("augmentations", True))
         self.normalize = bool(self.config.get("normalize", True))
+        self.split_mode = str(self.config.get("split_mode", "random")).lower()
+        self.forget_classes = self._normalize_forget_classes(self.config.get("forget_classes", []))
         self.forget_ratio = self.config.get("forget_ratio", 0.1)
         self.forget_count = self.config.get("forget_count", None)
         self.split_seed = int(self.config.get("split_seed", 42))
@@ -95,22 +99,90 @@ class UnlearningDataset:
         self.d_test = build_result.test_set
         self.num_classes = build_result.num_classes
 
-        self._du_indices, self._dr_indices = self._make_unlearning_split(len(self.d_all))
+        self._du_indices, self._dr_indices = self._make_unlearning_split(self.d_all)
         self.d_u = Subset(self.d_all, self._du_indices)
         self.d_r = Subset(self.d_all, self._dr_indices)
+        print(
+            f"[Dataset] split_mode={self.split_mode}, "
+            f"forget_classes={self.forget_classes if self.split_mode == 'by_class' else 'N/A'}, "
+            f"D_u={len(self.d_u)}, D_r={len(self.d_r)}"
+        )
 
-    def _make_unlearning_split(self, total_size: int) -> Tuple[Sequence[int], Sequence[int]]:
+    def _normalize_forget_classes(self, forget_classes) -> Sequence[int]:
+        """
+        Normalize class list from config.
+
+        Args:
+            forget_classes: Raw class config input.
+
+        Returns:
+            Sorted unique class ids.
+        """
+        if forget_classes is None:
+            return []
+        if isinstance(forget_classes, (int, float, str)):
+            forget_classes = [forget_classes]
+        normalized = sorted({int(x) for x in forget_classes})
+        return normalized
+
+    def _extract_label(self, dataset: Dataset, index: int) -> int:
+        """
+        Extract sample label from a dataset by index.
+
+        Args:
+            dataset: Source dataset.
+            index: Sample index.
+
+        Returns:
+            Integer class label.
+        """
+        _, target = dataset[index]
+        if isinstance(target, torch.Tensor):
+            return int(target.item())
+        return int(target)
+
+    def _make_unlearning_split(self, dataset: Dataset) -> Tuple[Sequence[int], Sequence[int]]:
         """
         Create deterministic D_u and D_r index splits.
 
         Args:
-            total_size: Number of samples in D_all.
+            dataset: Full training dataset D_all.
 
         Returns:
             Tuple of (du_indices, dr_indices).
         """
+        total_size = len(dataset)
         if total_size <= 0:
             return [], []
+
+        if self.split_mode == "by_class":
+            if not self.forget_classes:
+                raise ValueError(
+                    "split_mode='by_class' requires non-empty forget_classes, "
+                    "for example forget_classes: [0, 1]."
+                )
+
+            du_indices = []
+            dr_indices = []
+            for idx in range(total_size):
+                label = self._extract_label(dataset, idx)
+                if label in self.forget_classes:
+                    du_indices.append(idx)
+                else:
+                    dr_indices.append(idx)
+
+            if len(du_indices) == 0:
+                raise ValueError(
+                    f"No samples found for forget_classes={self.forget_classes}. "
+                    "Please check dataset labels."
+                )
+            if len(dr_indices) == 0:
+                raise ValueError(
+                    "All samples were assigned to D_u and D_r became empty. "
+                    "Please reduce forget_classes."
+                )
+
+            return du_indices, dr_indices
 
         if self.forget_count is not None:
             du_size = int(self.forget_count)

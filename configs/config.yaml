@@ -1,6 +1,8 @@
 dataset: cifar10
 data_path: datasets
 allow_download: false
+split_mode: random
+forget_classes: []
 
 batch_size: 64
 lr: 0.001

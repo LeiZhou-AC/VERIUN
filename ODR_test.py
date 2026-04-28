@@ -16,8 +16,26 @@ from pprint import pprint
 
 from configs.data.dataset import UnlearningDataset
 from unlearning.od import ODRUnlearner
-from utils.config import load=_config
+from utils.config import load_config
 from utils.seed import set_seed
+
+
+def _parse_forget_classes(raw: str):
+    """
+    Parse forget class ids from CLI string.
+
+    Args:
+        raw: Comma-separated class ids, for example "3,5,7".
+
+    Returns:
+        List of integer class ids.
+    """
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
 def _build_args() -> argparse.Namespace:
@@ -35,6 +53,19 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--in-channels", type=int, default=3, help="Input channel number")
     parser.add_argument("--forget-ratio", type=float, default=0.1, help="Fraction of data to forget")
     parser.add_argument("--forget-count", type=int, default=None, help="Absolute forget sample count")
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="random",
+        choices=["random", "by_class"],
+        help="How to split D_u and D_r",
+    )
+    parser.add_argument(
+        "--forget-classes",
+        type=str,
+        default="",
+        help="Comma-separated class ids for by_class mode, e.g. '3,5'",
+    )
     parser.add_argument("--split-seed", type=int, default=42, help="Seed for D_u / D_r split")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -78,6 +109,7 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "num_classes": args.num_classes,
             "in_channels": args.in_channels,
             "batch_size": args.batch_size,
+            "split_mode": args.split_mode,
             "forget_ratio": args.forget_ratio,
             "split_seed": args.split_seed,
             "seed": args.seed,
@@ -93,6 +125,9 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
     )
     if args.forget_count is not None:
         cfg["forget_count"] = args.forget_count
+    forget_classes = _parse_forget_classes(args.forget_classes)
+    if forget_classes:
+        cfg["forget_classes"] = forget_classes
     return cfg
 
 
