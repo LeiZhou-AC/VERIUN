@@ -1,6 +1,6 @@
 dataset: cifar10
-data_path: ~/zl/code/datasets
-allow_download: false
+data_path: datasets
+allow_download: True
 split_mode: random
 forget_classes: []
 

@@ -53,19 +53,8 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--in-channels", type=int, default=3, help="Input channel number")
     parser.add_argument("--forget-ratio", type=float, default=0.1, help="Fraction of data to forget")
     parser.add_argument("--forget-count", type=int, default=None, help="Absolute forget sample count")
-    parser.add_argument(
-        "--split-mode",
-        type=str,
-        default="random",
-        choices=["random", "by_class"],
-        help="How to split D_u and D_r",
-    )
-    parser.add_argument(
-        "--forget-classes",
-        type=str,
-        default="",
-        help="Comma-separated class ids for by_class mode, e.g. '3,5'",
-    )
+    parser.add_argument("--split-mode", type=str, default="by_class", choices=["random", "by_class"],help="How to split D_u and D_r")
+    parser.add_argument("--forget-classes", type=str, default="0", help="Comma-separated class ids for by_class mode, e.g. '3,5'")
     parser.add_argument("--split-seed", type=int, default=42, help="Seed for D_u / D_r split")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -74,18 +63,8 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.8, help="ODR forge mixing coefficient")
     parser.add_argument("--lambda-acc", type=float, default=0.5, help="Retention CE weight")
     parser.add_argument("--noise-std", type=float, default=0.01, help="Noise std for p_forge eta(x)")
-    parser.add_argument(
-        "--trained-path",
-        type=str,
-        default="save/weights/trained",
-        help="Trained model file or directory",
-    )
-    parser.add_argument(
-        "--unlearned-path",
-        type=str,
-        default="save/weights/unlearned",
-        help="Output directory for unlearned model",
-    )
+    parser.add_argument("--trained-path", type=str, default="save/weights/trained", help="Trained model file or directory" )
+    parser.add_argument("--unlearned-path", type=str, default="save/weights/unlearned", help="Output directory for unlearned model")
     parser.add_argument("--device", type=str, default="cuda", help="Device preference: cuda or cpu")
     return parser.parse_args()
 
