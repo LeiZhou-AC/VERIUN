@@ -1,6 +1,7 @@
 """Factory for selecting machine unlearning methods."""
 
 from unlearning.od import ODRUnlearner
+from unlearning.retrain import RetrainUnlearner
 
 
 def get_unlearner(name: str, config):
@@ -27,8 +28,7 @@ def get_unlearner(name: str, config):
     if normalized_name == "odr":
         return ODRUnlearner(config)
     if normalized_name == "retrain":
-        # TODO: Add a RetrainUnlearner implementation.
-        raise NotImplementedError("Retrain unlearner is reserved for future work.")
+        return RetrainUnlearner(config)
     if normalized_name == "finetune":
         # TODO: Add a FinetuneUnlearner implementation.
         raise NotImplementedError("Finetune unlearner is reserved for future work.")
