@@ -1,20 +1,15 @@
-# 在项目根目录创建 .gitignore 文件
-nano .gitignore
-# 或使用 vim
-vim .gitignore
-# 或直接用 echo 追加内容
-cat > .gitignore << 'EOF'
-
-#大文件
-save/
-datasets/
-
-
 # Python 缓存文件
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# 数据集和大文件
+datasets/
+save/
+*.tar
+*.tar.gz
+*.zip
 
 # 虚拟环境
 venv/
@@ -40,4 +35,3 @@ Thumbs.db
 # 环境变量
 .env
 .env.local
-EOF
