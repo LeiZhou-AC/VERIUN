@@ -6,6 +6,7 @@ remove D_u and retrain a fresh model on D_r.
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -24,6 +25,113 @@ from configs.data.dataset import UnlearningDataset
 from configs.models.resnet import construct_model
 from unlearning.base_unlearner import BaseUnlearner
 from utils.config import load_config
+
+
+def _parse_forget_classes(raw: str):
+    """
+    Parse forget classes from CLI string.
+
+    Args:
+        raw: Comma-separated class ids, e.g. "3,5,7".
+
+    Returns:
+        List of integer class ids.
+    """
+    text = str(raw).strip()
+    if not text:
+        return []
+    return [int(x.strip()) for x in text.split(",") if x.strip()]
+
+
+def _build_args() -> argparse.Namespace:
+    """
+    Build CLI arguments for retraining unlearning.
+
+    Returns:
+        Parsed arguments.
+    """
+    parser = argparse.ArgumentParser(description="Naive retraining unlearning")
+    parser.add_argument("--config", type=str, default="configs/config.yaml")
+    parser.add_argument("--dataset", type=str, default=None)
+    parser.add_argument("--model-name", type=str, default=None)
+    parser.add_argument("--num-classes", type=int, default=None)
+    parser.add_argument("--in-channels", type=int, default=None)
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--allow-download", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default=None,
+        choices=["random", "by_class"],
+        help="Unlearning split mode.",
+    )
+    parser.add_argument("--forget-ratio", type=float, default=None)
+    parser.add_argument("--forget-count", type=int, default=None)
+    parser.add_argument("--forget-classes", type=str, default="")
+    parser.add_argument("--split-seed", type=int, default=None)
+
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--momentum", type=float, default=None)
+    parser.add_argument("--optimizer", type=str, default=None, choices=["sgd", "adamw"])
+    parser.add_argument("--unlearned-path", type=str, default=None)
+    parser.add_argument("--save-name", type=str, default=None)
+    return parser.parse_args()
+
+
+def _merge_config(base_cfg: Dict, args: argparse.Namespace) -> Dict:
+    """
+    Merge CLI overrides into base config.
+
+    Args:
+        base_cfg: Base config loaded from file.
+        args: Parsed CLI args.
+
+    Returns:
+        Final config dictionary.
+    """
+    cfg = dict(base_cfg or {})
+
+    def set_if_not_none(key, value):
+        if value is not None:
+            cfg[key] = value
+
+    set_if_not_none("dataset", args.dataset)
+    set_if_not_none("model_name", args.model_name)
+    set_if_not_none("num_classes", args.num_classes)
+    set_if_not_none("in_channels", args.in_channels)
+    set_if_not_none("data_path", args.data_path)
+    set_if_not_none("batch_size", args.batch_size)
+    set_if_not_none("num_workers", args.num_workers)
+    set_if_not_none("seed", args.seed)
+    set_if_not_none("device", args.device)
+
+    set_if_not_none("split_mode", args.split_mode)
+    set_if_not_none("forget_ratio", args.forget_ratio)
+    set_if_not_none("forget_count", args.forget_count)
+    set_if_not_none("split_seed", args.split_seed)
+    if args.forget_classes.strip():
+        cfg["forget_classes"] = _parse_forget_classes(args.forget_classes)
+
+    set_if_not_none("retrain_epochs", args.epochs)
+    set_if_not_none("retrain_lr", args.lr)
+    set_if_not_none("retrain_weight_decay", args.weight_decay)
+    set_if_not_none("retrain_momentum", args.momentum)
+    set_if_not_none("retrain_optimizer", args.optimizer)
+
+    if args.allow_download:
+        cfg["allow_download"] = True
+    if args.unlearned_path is not None:
+        cfg["unlearned_weights_path"] = args.unlearned_path
+    if args.save_name is not None:
+        cfg["retrain_checkpoint_name"] = args.save_name
+    return cfg
 
 
 def set_seed(seed: int) -> None:
@@ -248,8 +356,9 @@ class RetrainUnlearner(BaseUnlearner):
 
 def main() -> None:
     """Standalone CLI entry for retraining unlearning."""
-    base_cfg = load_config("configs/config.yaml")
-    cfg = dict(base_cfg or {})
+    args = _build_args()
+    base_cfg = load_config(args.config)
+    cfg = _merge_config(base_cfg, args)
     dataset = UnlearningDataset(cfg)
     unlearner = RetrainUnlearner(cfg)
     unlearner.unlearn(model=None, dataset=dataset)
