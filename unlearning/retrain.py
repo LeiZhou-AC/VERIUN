@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 import sys
@@ -52,35 +53,35 @@ def _build_args() -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(description="Naive retraining unlearning")
     parser.add_argument("--config", type=str, default="configs/config.yaml")
-    parser.add_argument("--dataset", type=str, default=None)
-    parser.add_argument("--model-name", type=str, default=None)
-    parser.add_argument("--num-classes", type=int, default=None)
-    parser.add_argument("--in-channels", type=int, default=None)
-    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--dataset", type=str, default="cifar10")
+    parser.add_argument("--model-name", type=str, default="resnet18")
+    parser.add_argument("--num-classes", type=int, default=10)
+    parser.add_argument("--in-channels", type=int, default=3)
+    parser.add_argument("--data-path", type=str, default="datasets")
     parser.add_argument("--allow-download", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument(
         "--split-mode",
         type=str,
-        default=None,
+        default="random",
         choices=["random", "by_class"],
         help="Unlearning split mode.",
     )
-    parser.add_argument("--forget-ratio", type=float, default=None)
+    parser.add_argument("--forget-ratio", type=float, default=0.1)
     parser.add_argument("--forget-count", type=int, default=None)
     parser.add_argument("--forget-classes", type=str, default="")
-    parser.add_argument("--split-seed", type=int, default=None)
+    parser.add_argument("--split-seed", type=int, default=42)
 
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--weight-decay", type=float, default=None)
-    parser.add_argument("--momentum", type=float, default=None)
-    parser.add_argument("--optimizer", type=str, default=None, choices=["sgd", "adamw"])
-    parser.add_argument("--unlearned-path", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adamw"])
+    parser.add_argument("--unlearned-path", type=str, default="save/weights/unlearned")
     parser.add_argument("--save-name", type=str, default=None)
     return parser.parse_args()
 
@@ -186,6 +187,30 @@ class RetrainUnlearner(BaseUnlearner):
         self.optimizer_name = str(
             self.config.get("retrain_optimizer", self.config.get("optimizer", "sgd"))
         ).lower()
+
+    def _infer_unlearn_target_tag(self) -> str:
+        """
+        Build a concise tag describing unlearning target definition.
+
+        Returns:
+            Target tag string for checkpoint naming.
+        """
+        split_mode = str(self.config.get("split_mode", "random")).lower()
+        if split_mode == "by_class":
+            classes = self.config.get("forget_classes", [])
+            if isinstance(classes, (int, float, str)):
+                classes = [classes]
+            classes = [str(int(c)) for c in classes]
+            if classes:
+                return "byclass_" + "-".join(classes)
+            return "byclass_unspecified"
+
+        if self.config.get("forget_count") is not None:
+            return f"random_count{int(self.config.get('forget_count'))}"
+
+        ratio = float(self.config.get("forget_ratio", 0.1))
+        ratio_str = str(ratio).replace(".", "p")
+        return f"random_ratio{ratio_str}"
 
     def _build_fresh_model(self, dataset: UnlearningDataset) -> nn.Module:
         """
@@ -332,10 +357,14 @@ class RetrainUnlearner(BaseUnlearner):
 
         save_dir = Path(str(self.config.get("unlearned_weights_path", "save/weights/unlearned")))
         save_dir.mkdir(parents=True, exist_ok=True)
+        model_name = str(self.config.get("model_name", "resnet18"))
+        target_tag = self._infer_unlearn_target_tag()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_ckpt_name = f"retrain_{model_name}_{dataset.dataset_name}_{target_tag}_{ts}.pt"
         ckpt_name = str(
             self.config.get(
                 "retrain_checkpoint_name",
-                f"retrain_{self.config.get('model_name', 'resnet18')}_{dataset.dataset_name}.pt",
+                default_ckpt_name,
             )
         )
         save_path = save_dir / ckpt_name
@@ -343,8 +372,13 @@ class RetrainUnlearner(BaseUnlearner):
             {
                 "state_dict": model.state_dict(),
                 "method": "retrain",
-                "model_name": self.config.get("model_name", "resnet18"),
+                "model_name": model_name,
                 "dataset": dataset.dataset_name,
+                "split_mode": self.config.get("split_mode", "random"),
+                "forget_classes": self.config.get("forget_classes", []),
+                "forget_ratio": self.config.get("forget_ratio", None),
+                "forget_count": self.config.get("forget_count", None),
+                "seed": int(self.config.get("seed", 42)),
             },
             str(save_path),
         )
