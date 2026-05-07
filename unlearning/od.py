@@ -32,6 +32,7 @@ class ODRStats:
     kl_loss: float
     retain_ce: float
     forget_confidence: float
+    unlearn_accuracy: float
 
 
 class ODRUnlearner(BaseUnlearner):
@@ -309,6 +310,32 @@ class ODRUnlearner(BaseUnlearner):
         print(f"[ODR][Eval] forget-set mean confidence: {value:.4f}")
         return value
 
+    def _evaluate_unlearn_accuracy(self, model: nn.Module, loader: DataLoader) -> float:
+        """
+        Evaluate classification accuracy on forget set D_u.
+
+        Args:
+            model: Model to evaluate.
+            loader: Forget-set dataloader.
+
+        Returns:
+            Forget-set accuracy in [0, 1].
+        """
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                logits = model(x)
+                pred = logits.argmax(dim=1)
+                correct += int((pred == y).sum().item())
+                total += int(y.size(0))
+        acc = correct / float(max(total, 1))
+        print(f"[ODR][Eval] unlearn accuracy: {acc:.4f} ({correct}/{total})")
+        return acc
+
     def unlearn(self, model: Optional[nn.Module], dataset) -> Dict:
         """
         Execute full ODR unlearning workflow.
@@ -368,9 +395,11 @@ class ODRUnlearner(BaseUnlearner):
             epoch_kl = 0.0
             epoch_retain = 0.0
             forget_conf = 0.0
+            forget_correct = 0
+            forget_total = 0
             steps = 0
 
-            for forget_x, _ in forget_loader:
+            for forget_x, forget_y in forget_loader:
                 try:
                     retain_x, retain_y = next(retain_iter)
                 except StopIteration:
@@ -378,6 +407,7 @@ class ODRUnlearner(BaseUnlearner):
                     retain_x, retain_y = next(retain_iter)
 
                 forget_x = forget_x.to(self.device)
+                forget_y = forget_y.to(self.device)
                 retain_x = retain_x.to(self.device)
                 retain_y = retain_y.to(self.device)
 
@@ -401,6 +431,9 @@ class ODRUnlearner(BaseUnlearner):
                 with torch.no_grad():
                     forget_probs = F.softmax(forget_logits, dim=1)
                     batch_conf = forget_probs.max(dim=1).values.mean().item()
+                    forget_pred = forget_logits.argmax(dim=1)
+                    forget_correct += int((forget_pred == forget_y).sum().item())
+                    forget_total += int(forget_y.size(0))
 
                 epoch_total += float(total_loss.item())
                 epoch_kl += float(kl_loss.item())
@@ -413,6 +446,7 @@ class ODRUnlearner(BaseUnlearner):
                 kl_loss=epoch_kl / max(steps, 1),
                 retain_ce=epoch_retain / max(steps, 1),
                 forget_confidence=forget_conf / max(steps, 1),
+                unlearn_accuracy=forget_correct / float(max(forget_total, 1)),
             )
             history.append(
                 {
@@ -421,6 +455,7 @@ class ODRUnlearner(BaseUnlearner):
                     "kl_loss": stats.kl_loss,
                     "retain_ce": stats.retain_ce,
                     "forget_confidence": stats.forget_confidence,
+                    "unlearn_accuracy": stats.unlearn_accuracy,
                 }
             )
 
@@ -429,13 +464,16 @@ class ODRUnlearner(BaseUnlearner):
                 f"total={stats.total_loss:.6f} "
                 f"kl={stats.kl_loss:.6f} "
                 f"retain_ce={stats.retain_ce:.6f} "
-                f"forget_conf={stats.forget_confidence:.4f}"
+                f"forget_conf={stats.forget_confidence:.4f} "
+                f"unlearn_acc={stats.unlearn_accuracy:.4f}"
             )
 
             if epoch % self.validate_every == 0:
                 self._evaluate_accuracy(model, retain_loader, "retain")
                 self._evaluate_accuracy(model, test_loader, "test")
                 self._evaluate_forget_confidence(model, forget_loader)
+                eval_unlearn_acc = self._evaluate_unlearn_accuracy(model, forget_loader)
+                history[-1]["unlearn_accuracy"] = eval_unlearn_acc
 
         save_dir = Path(self.config.get("unlearned_weights_path", "save/weights/unlearned"))
         save_dir.mkdir(parents=True, exist_ok=True)
