@@ -9,6 +9,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Dict
+import sys
+
+# Allow running this script via absolute/relative file path.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 from torch import nn
