@@ -33,6 +33,8 @@ class ODRStats:
     retain_ce: float
     forget_confidence: float
     unlearn_accuracy: float
+    retain_accuracy: float
+    test_accuracy: float
 
 
 class ODRUnlearner(BaseUnlearner):
@@ -447,6 +449,8 @@ class ODRUnlearner(BaseUnlearner):
                 retain_ce=epoch_retain / max(steps, 1),
                 forget_confidence=forget_conf / max(steps, 1),
                 unlearn_accuracy=forget_correct / float(max(forget_total, 1)),
+                retain_accuracy=0.0,
+                test_accuracy=0.0,
             )
             history.append(
                 {
@@ -456,6 +460,8 @@ class ODRUnlearner(BaseUnlearner):
                     "retain_ce": stats.retain_ce,
                     "forget_confidence": stats.forget_confidence,
                     "unlearn_accuracy": stats.unlearn_accuracy,
+                    "retain_accuracy": stats.retain_accuracy,
+                    "test_accuracy": stats.test_accuracy,
                 }
             )
 
@@ -465,14 +471,18 @@ class ODRUnlearner(BaseUnlearner):
                 f"kl={stats.kl_loss:.6f} "
                 f"retain_ce={stats.retain_ce:.6f} "
                 f"forget_conf={stats.forget_confidence:.4f} "
-                f"unlearn_acc={stats.unlearn_accuracy:.4f}"
+                f"unlearn_acc={stats.unlearn_accuracy:.4f} "
+                f"retain_acc={stats.retain_accuracy:.4f} "
+                f"test_acc={stats.test_accuracy:.4f}"
             )
 
             if epoch % self.validate_every == 0:
-                self._evaluate_accuracy(model, retain_loader, "retain")
-                self._evaluate_accuracy(model, test_loader, "test")
+                eval_retain_acc = self._evaluate_accuracy(model, retain_loader, "retain")
+                eval_test_acc = self._evaluate_accuracy(model, test_loader, "test")
                 self._evaluate_forget_confidence(model, forget_loader)
                 eval_unlearn_acc = self._evaluate_unlearn_accuracy(model, forget_loader)
+                history[-1]["retain_accuracy"] = eval_retain_acc
+                history[-1]["test_accuracy"] = eval_test_acc
                 history[-1]["unlearn_accuracy"] = eval_unlearn_acc
 
         save_dir = Path(self.config.get("unlearned_weights_path", "save/weights/unlearned"))
