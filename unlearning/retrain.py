@@ -74,6 +74,8 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--forget-ratio", type=float, default=0.1)
     parser.add_argument("--forget-count", type=int, default=None)
     parser.add_argument("--forget-classes", type=str, default="")
+    parser.add_argument("--forget-manifest-path", type=str, default="save/manifests/retrain_forget_manifest.json")
+    parser.add_argument("--forget-manifest-mode", type=str, default="auto", choices=["auto", "load", "save", "off"])
     parser.add_argument("--split-seed", type=int, default=42)
 
     parser.add_argument("--epochs", type=int, default=40)
@@ -117,6 +119,8 @@ def _merge_config(base_cfg: Dict, args: argparse.Namespace) -> Dict:
     set_if_not_none("forget_ratio", args.forget_ratio)
     set_if_not_none("forget_count", args.forget_count)
     set_if_not_none("split_seed", args.split_seed)
+    set_if_not_none("forget_manifest_path", args.forget_manifest_path)
+    set_if_not_none("forget_manifest_mode", args.forget_manifest_mode)
     if args.forget_classes.strip():
         cfg["forget_classes"] = _parse_forget_classes(args.forget_classes)
 
@@ -378,6 +382,12 @@ class RetrainUnlearner(BaseUnlearner):
                 "forget_classes": self.config.get("forget_classes", []),
                 "forget_ratio": self.config.get("forget_ratio", None),
                 "forget_count": self.config.get("forget_count", None),
+                "forget_manifest_path": (
+                    dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+                ),
+                "forget_manifest": (
+                    dataset.get_forget_manifest_info() if hasattr(dataset, "get_forget_manifest_info") else None
+                ),
                 "seed": int(self.config.get("seed", 42)),
             },
             str(save_path),
@@ -385,7 +395,19 @@ class RetrainUnlearner(BaseUnlearner):
         print(f"[RETRAIN] Saved unlearned model to: {save_path}")
         print("[RETRAIN] ===== Retraining Unlearning Finished =====")
 
-        return {"status": "ok", "method": "retrain", "model": model, "save_path": str(save_path), "history": history}
+        return {
+            "status": "ok",
+            "method": "retrain",
+            "model": model,
+            "save_path": str(save_path),
+            "history": history,
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+            "forget_manifest": (
+                dataset.get_forget_manifest_info() if hasattr(dataset, "get_forget_manifest_info") else None
+            ),
+        }
 
 
 def main() -> None:

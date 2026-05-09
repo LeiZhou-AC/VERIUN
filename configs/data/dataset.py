@@ -9,7 +9,9 @@ This module provides:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
+import json
 import os
 
 import torch
@@ -64,6 +66,8 @@ class UnlearningDataset:
         - allow_download: bool, whether to download when local data is missing
         - split_mode: str, `random` or `by_class`
         - forget_classes: list[int], used when split_mode is `by_class`
+        - forget_manifest_path: str, path to persisted D_u/D_r indices
+        - forget_manifest_mode: str, one of `auto`, `load`, `save`, `off`
         - batch_size: int
         - num_workers: int
         - pin_memory: bool
@@ -87,6 +91,9 @@ class UnlearningDataset:
         self.forget_ratio = self.config.get("forget_ratio", 0.1)
         self.forget_count = self.config.get("forget_count", None)
         self.split_seed = int(self.config.get("split_seed", 42))
+        self.forget_manifest_mode = str(self.config.get("forget_manifest_mode", "auto")).lower()
+        self.forget_manifest_path = self._resolve_manifest_path(self.config.get("forget_manifest_path", None))
+        self._forget_manifest_info = None
 
         build_result = _build_dataset(
             dataset_name=self.dataset_name,
@@ -107,6 +114,107 @@ class UnlearningDataset:
             f"forget_classes={self.forget_classes if self.split_mode == 'by_class' else 'N/A'}, "
             f"D_u={len(self.d_u)}, D_r={len(self.d_r)}"
         )
+
+    def _resolve_manifest_path(self, path_value) -> Path:
+        """
+        Resolve manifest path from config or generate a default one.
+
+        Args:
+            path_value: Optional user-provided manifest path.
+
+        Returns:
+            Resolved manifest path.
+        """
+        if path_value:
+            return Path(os.path.expanduser(str(path_value)))
+
+        default_dir = Path("save/manifests")
+        default_name = f"forget_{self.dataset_name}_{self.split_mode}.json"
+        return default_dir / default_name
+
+    def _build_manifest_payload(self, du_indices: Sequence[int], dr_indices: Sequence[int], total_size: int) -> Dict:
+        """
+        Build manifest payload for persistence.
+
+        Args:
+            du_indices: Forget-set indices.
+            dr_indices: Retained-set indices.
+            total_size: Total dataset size.
+
+        Returns:
+            JSON-serializable manifest payload.
+        """
+        return {
+            "dataset": self.dataset_name,
+            "split_mode": self.split_mode,
+            "total_size": int(total_size),
+            "split_seed": int(self.split_seed),
+            "forget_ratio": None if self.forget_count is not None else float(self.forget_ratio),
+            "forget_count": None if self.forget_count is None else int(self.forget_count),
+            "forget_classes": [int(x) for x in self.forget_classes],
+            "du_indices": [int(x) for x in du_indices],
+            "dr_indices": [int(x) for x in dr_indices],
+        }
+
+    def _save_manifest(self, payload: Dict) -> None:
+        """
+        Save manifest payload to disk.
+
+        Args:
+            payload: Manifest dictionary.
+        """
+        manifest_path = self.forget_manifest_path
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._forget_manifest_info = payload
+        print(f"[Dataset] Saved forget manifest: {manifest_path}")
+
+    def _load_manifest(self) -> Dict:
+        """
+        Load manifest payload from disk.
+
+        Returns:
+            Manifest dictionary.
+        """
+        manifest_path = self.forget_manifest_path
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Forget manifest not found: {manifest_path}")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self._forget_manifest_info = payload
+        print(f"[Dataset] Loaded forget manifest: {manifest_path}")
+        return payload
+
+    def _validate_manifest(self, payload: Dict, total_size: int) -> Tuple[Sequence[int], Sequence[int]]:
+        """
+        Validate and extract indices from a manifest.
+
+        Args:
+            payload: Manifest payload.
+            total_size: Expected dataset size.
+
+        Returns:
+            Tuple of (du_indices, dr_indices).
+        """
+        if payload.get("dataset") != self.dataset_name:
+            raise ValueError(
+                f"Manifest dataset mismatch: expected {self.dataset_name}, got {payload.get('dataset')}"
+            )
+        if int(payload.get("total_size", -1)) != int(total_size):
+            raise ValueError(
+                f"Manifest total_size mismatch: expected {total_size}, got {payload.get('total_size')}"
+            )
+
+        du_indices = [int(x) for x in payload.get("du_indices", [])]
+        dr_indices = [int(x) for x in payload.get("dr_indices", [])]
+        if not du_indices or not dr_indices:
+            raise ValueError("Manifest contains empty D_u or D_r.")
+        if len(set(du_indices).intersection(set(dr_indices))) > 0:
+            raise ValueError("Manifest contains overlapping indices between D_u and D_r.")
+        if len(du_indices) + len(dr_indices) != total_size:
+            raise ValueError(
+                "Manifest index count mismatch: len(D_u)+len(D_r) must equal len(D_all)."
+            )
+        return du_indices, dr_indices
 
     def _normalize_forget_classes(self, forget_classes) -> Sequence[int]:
         """
@@ -155,6 +263,15 @@ class UnlearningDataset:
         if total_size <= 0:
             return [], []
 
+        if self.split_mode == "random" and self.forget_manifest_mode in {"auto", "load"}:
+            if self.forget_manifest_path.exists():
+                payload = self._load_manifest()
+                return self._validate_manifest(payload, total_size)
+            if self.forget_manifest_mode == "load":
+                raise FileNotFoundError(
+                    f"forget_manifest_mode='load' but file does not exist: {self.forget_manifest_path}"
+                )
+
         if self.split_mode == "by_class":
             if not self.forget_classes:
                 raise ValueError(
@@ -182,6 +299,11 @@ class UnlearningDataset:
                     "Please reduce forget_classes."
                 )
 
+            payload = self._build_manifest_payload(du_indices, dr_indices, total_size)
+            if self.forget_manifest_mode in {"auto", "save"}:
+                self._save_manifest(payload)
+            else:
+                self._forget_manifest_info = payload
             return du_indices, dr_indices
 
         if self.forget_count is not None:
@@ -197,7 +319,30 @@ class UnlearningDataset:
 
         du_indices = perm[:du_size]
         dr_indices = perm[du_size:]
+        payload = self._build_manifest_payload(du_indices, dr_indices, total_size)
+        if self.split_mode == "random" and self.forget_manifest_mode in {"auto", "save"}:
+            self._save_manifest(payload)
+        else:
+            self._forget_manifest_info = payload
         return du_indices, dr_indices
+
+    def get_forget_manifest_info(self) -> Optional[Dict]:
+        """
+        Return the current forget-manifest metadata.
+
+        Returns:
+            Manifest dictionary or None.
+        """
+        return self._forget_manifest_info
+
+    def get_forget_manifest_path(self) -> str:
+        """
+        Return forget-manifest path as string.
+
+        Returns:
+            Manifest path.
+        """
+        return str(self.forget_manifest_path)
 
     def get_all_set(self) -> Dataset:
         """

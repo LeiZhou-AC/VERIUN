@@ -3,6 +3,8 @@ data_path: datasets
 allow_download: True
 split_mode: random
 forget_classes: []
+forget_manifest_path: save/manifests/default_forget_manifest.json
+forget_manifest_mode: auto
 
 batch_size: 64
 lr: 0.001

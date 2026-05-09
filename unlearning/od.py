@@ -489,7 +489,25 @@ class ODRUnlearner(BaseUnlearner):
         save_dir.mkdir(parents=True, exist_ok=True)
         default_name = f"odr_{self._infer_run_tag(dataset)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
         save_path = save_dir / self.config.get("unlearned_checkpoint_name", default_name)
-        torch.save(model.state_dict(), str(save_path))
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "method": "odr",
+                "model_name": self.config.get("model_name", self.config.get("model", "resnet18")),
+                "dataset": self.config.get("dataset", getattr(dataset, "dataset_name", "unknown")),
+                "split_mode": self.config.get("split_mode", "random"),
+                "forget_classes": self.config.get("forget_classes", []),
+                "forget_ratio": self.config.get("forget_ratio", None),
+                "forget_count": self.config.get("forget_count", None),
+                "forget_manifest_path": (
+                    dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+                ),
+                "forget_manifest": (
+                    dataset.get_forget_manifest_info() if hasattr(dataset, "get_forget_manifest_info") else None
+                ),
+            },
+            str(save_path),
+        )
         print(f"[ODR] Unlearned model saved to: {save_path}")
         print("[ODR] ===== ODR Unlearning Finished =====")
 
@@ -499,4 +517,10 @@ class ODRUnlearner(BaseUnlearner):
             "model": model,
             "save_path": str(save_path),
             "history": history,
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+            "forget_manifest": (
+                dataset.get_forget_manifest_info() if hasattr(dataset, "get_forget_manifest_info") else None
+            ),
         }
