@@ -22,7 +22,7 @@ def get_verifier(name: str, config=None):
     normalized_name = name.lower()
 
     if normalized_name == "ruv":
-        return RUVVerifier()
+        return RUVVerifier(config=config)
     if normalized_name == "mia":
         return MIAVerifier()
     if normalized_name in {"output_diff", "outputdifference", "output-diff"}:

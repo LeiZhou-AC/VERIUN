@@ -55,8 +55,6 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--forget-count", type=int, default=None, help="Absolute forget sample count")
     parser.add_argument("--split-mode", type=str, default="by_class", choices=["random", "by_class"],help="How to split D_u and D_r")
     parser.add_argument("--forget-classes", type=str, default="0", help="Comma-separated class ids for by_class mode, e.g. '3,5'")
-    parser.add_argument("--forget-manifest-path", type=str, default="save/manifests/odr_forget_manifest.json")
-    parser.add_argument("--forget-manifest-mode", type=str, default="auto", choices=["auto", "load", "save", "off"])
     parser.add_argument("--split-seed", type=int, default=42, help="Seed for D_u / D_r split")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -92,8 +90,6 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "batch_size": args.batch_size,
             "split_mode": args.split_mode,
             "forget_ratio": args.forget_ratio,
-            "forget_manifest_path": args.forget_manifest_path,
-            "forget_manifest_mode": args.forget_manifest_mode,
             "split_seed": args.split_seed,
             "seed": args.seed,
             "odr_epochs": args.epochs,
