@@ -82,9 +82,9 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--forget-classes", type=str, default="")
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--forget-manifest-path", type=str, default="save/manifests/default_forget_manifest.json")
-    parser.add_argument("--forget-manifest-mode", type=str, default="load", choices=["auto", "load", "save", "off"])
+    parser.add_argument("--forget-manifest-mode", type=str, default="off", choices=["auto", "load", "save", "off"])
 
-    parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned")
+    parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned/odr_resnet18_cifar10_20260519_164429.pt")
     parser.add_argument("--probe-test-size", type=float, default=0.3)
     parser.add_argument("--c-grid", type=str, default="0.01,0.1,1.0,10.0,100.0")
     parser.add_argument("--inner-cv-folds", type=int, default=5)
