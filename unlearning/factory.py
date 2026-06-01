@@ -1,6 +1,7 @@
 """Factory for selecting machine unlearning methods."""
 
 from unlearning.od import ODRUnlearner
+from unlearning.odr_gate import ODRGateUnlearner
 from unlearning.retrain import RetrainUnlearner
 
 
@@ -27,6 +28,8 @@ def get_unlearner(name: str, config):
 
     if normalized_name == "odr":
         return ODRUnlearner(config)
+    if normalized_name in {"odr_gate", "odr-gate", "odrgate"}:
+        return ODRGateUnlearner(config)
     if normalized_name == "retrain":
         return RetrainUnlearner(config)
     if normalized_name == "finetune":
