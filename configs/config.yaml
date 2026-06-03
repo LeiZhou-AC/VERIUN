@@ -13,5 +13,6 @@ alpha: 1.0
 "lambda": 0.5
 
 ruv_distance: cosine
+ruv_mode: auto
 ruv_alpha: 0.05
 ruv_num_permutations: 100

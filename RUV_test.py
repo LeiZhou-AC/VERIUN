@@ -45,6 +45,22 @@ def _parse_forget_classes(raw: str):
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
+def _parse_layers(raw: str):
+    """
+    Parse RUV representation stage names from CLI string.
+
+    Args:
+        raw: Comma-separated stage names.
+
+    Returns:
+        List of stage names.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    return [item.strip().lower() for item in text.split(",") if item.strip()]
+
+
 def _build_args() -> argparse.Namespace:
     """
     Build CLI arguments.
@@ -75,6 +91,9 @@ def _build_args() -> argparse.Namespace:
 
     parser.add_argument("--original-model-path", type=str, default="save/weights/trained")
     parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned")
+    parser.add_argument("--ruv-mode", type=str, default="auto", choices=["auto", "class", "sample"])
+    parser.add_argument("--ruv-layers", type=str, default="")
+    parser.add_argument("--ruv-control-layers", type=str, default="")
     parser.add_argument("--distance", type=str, default="cosine", choices=["cosine", "l2"])
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--num-permutations", type=int, default=100)
@@ -112,11 +131,18 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "split_seed": args.split_seed,
             "forget_manifest_path": args.forget_manifest_path,
             "forget_manifest_mode": args.forget_manifest_mode,
+            "ruv_mode": args.ruv_mode,
             "ruv_distance": args.distance,
             "ruv_alpha": args.alpha,
             "ruv_num_permutations": args.num_permutations,
         }
     )
+    ruv_layers = _parse_layers(args.ruv_layers)
+    if ruv_layers is not None:
+        cfg["ruv_layers"] = ruv_layers
+    ruv_control_layers = _parse_layers(args.ruv_control_layers)
+    if ruv_control_layers is not None:
+        cfg["ruv_control_layers"] = ruv_control_layers
     if args.forget_count is not None:
         cfg["forget_count"] = args.forget_count
     forget_classes = _parse_forget_classes(args.forget_classes)

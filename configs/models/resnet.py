@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 import random
 
 import numpy as np
@@ -166,6 +166,72 @@ class ResNetWrapper(nn.Module):
         """
         features = self.backbone(x)
         return torch.flatten(features, 1)
+
+    def extract_layer_representations(
+        self,
+        x: torch.Tensor,
+        layers: Optional[Sequence[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Extract pooled representation states from selected hierarchy stages.
+
+        Args:
+            x: Input image batch.
+            layers: Stage names to collect. Preferred architecture-agnostic
+                names are early/middle/late/prelogit. ResNet-specific aliases
+                layer1/layer2/layer3/layer4/penultimate are also supported.
+
+        Returns:
+            Mapping from requested stage name to flattened representation tensor.
+        """
+        requested = [str(name).lower() for name in (layers or ["prelogit"])]
+        stage_to_resnet_layers = {
+            "early": ["layer1"],
+            "middle": ["layer2", "layer3"],
+            "late": ["layer4"],
+            "prelogit": ["penultimate"],
+            "penultimate": ["penultimate"],
+            "layer1": ["layer1"],
+            "layer2": ["layer2"],
+            "layer3": ["layer3"],
+            "layer4": ["layer4"],
+        }
+        unsupported = set(requested) - set(stage_to_resnet_layers)
+        if unsupported:
+            raise ValueError(f"Unsupported representation stages: {sorted(unsupported)}")
+
+        needed_resnet_layers = {
+            layer
+            for stage in requested
+            for layer in stage_to_resnet_layers[stage]
+        }
+
+        layer_outputs: Dict[str, torch.Tensor] = {}
+        h = x
+        for index, module in enumerate(self.backbone):
+            h = module(h)
+            layer_name = {
+                4: "layer1",
+                5: "layer2",
+                6: "layer3",
+                7: "layer4",
+            }.get(index)
+            if layer_name in needed_resnet_layers:
+                pooled = nn.functional.adaptive_avg_pool2d(h, output_size=(1, 1))
+                layer_outputs[layer_name] = torch.flatten(pooled, 1)
+
+        if "penultimate" in needed_resnet_layers:
+            layer_outputs["penultimate"] = torch.flatten(h, 1)
+
+        stage_outputs: Dict[str, torch.Tensor] = {}
+        for stage in requested:
+            tensors = [layer_outputs[layer] for layer in stage_to_resnet_layers[stage]]
+            if len(tensors) == 1:
+                stage_outputs[stage] = tensors[0]
+            else:
+                normalized = [nn.functional.normalize(tensor, p=2, dim=1) for tensor in tensors]
+                stage_outputs[stage] = torch.cat(normalized, dim=1)
+        return stage_outputs
 
     def get_classifier(self) -> nn.Module:
         """
