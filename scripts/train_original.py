@@ -9,12 +9,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Dict
-import sys
-
-# Allow running this script via absolute/relative file path.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 from torch import nn
@@ -55,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", type=str, default="resnet18")
     parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adamw"])

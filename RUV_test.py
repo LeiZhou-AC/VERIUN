@@ -66,12 +66,12 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--split-mode", type=str, default="random", choices=["random", "by_class"])
-    parser.add_argument("--forget-ratio", type=float, default=0.1)
+    parser.add_argument("--forget-ratio", type=float, default=0.01)
     parser.add_argument("--forget-count", type=int, default=None)
     parser.add_argument("--forget-classes", type=str, default="")
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--forget-manifest-path", type=str, default="save/manifests/default_forget_manifest.json")
-    parser.add_argument("--forget-manifest-mode", type=str, default="off", choices=["auto", "load", "save", "off"])
+    parser.add_argument("--forget-manifest-mode", type=str, default="load", choices=["auto", "load", "save", "off"])
 
     parser.add_argument("--original-model-path", type=str, default="save/weights/trained")
     parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned")
