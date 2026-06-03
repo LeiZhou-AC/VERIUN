@@ -1,6 +1,8 @@
 """End-to-end RUV runner.
 
-This script verifies an unlearned model M_u using representation-level probing.
+This script verifies an unlearned model M_u with Representation Update
+Verification.  It compares representations from the original model M_s and the
+unlearned model M_u on the same samples.
 It reuses the same forget manifest mechanism as ODR/retrain so random forget
 sets are aligned across methods.
 """
@@ -43,19 +45,6 @@ def _parse_forget_classes(raw: str):
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
-def _parse_c_grid(raw: str):
-    """
-    Parse C grid from CLI string.
-
-    Args:
-        raw: Comma-separated C values.
-
-    Returns:
-        List of floats.
-    """
-    return [float(x.strip()) for x in str(raw).split(",") if x.strip()]
-
-
 def _build_args() -> argparse.Namespace:
     """
     Build CLI arguments.
@@ -84,13 +73,11 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--forget-manifest-path", type=str, default="save/manifests/default_forget_manifest.json")
     parser.add_argument("--forget-manifest-mode", type=str, default="off", choices=["auto", "load", "save", "off"])
 
-    parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned/odr_resnet18_cifar10_20260519_164429.pt")
-    parser.add_argument("--probe-test-size", type=float, default=0.3)
-    parser.add_argument("--c-grid", type=str, default="0.01,0.1,1.0,10.0,100.0")
-    parser.add_argument("--inner-cv-folds", type=int, default=5)
+    parser.add_argument("--original-model-path", type=str, default="save/weights/trained")
+    parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned")
+    parser.add_argument("--distance", type=str, default="cosine", choices=["cosine", "l2"])
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--num-permutations", type=int, default=100)
-    parser.add_argument("--probe-max-iter", type=int, default=2000)
     parser.add_argument("--result-dir", type=str, default="save/results/ruv")
     parser.add_argument("--result-name", type=str, default="")
     return parser.parse_args()
@@ -125,12 +112,9 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "split_seed": args.split_seed,
             "forget_manifest_path": args.forget_manifest_path,
             "forget_manifest_mode": args.forget_manifest_mode,
-            "ruv_probe_test_size": args.probe_test_size,
-            "ruv_c_grid": _parse_c_grid(args.c_grid),
-            "ruv_inner_cv_folds": args.inner_cv_folds,
+            "ruv_distance": args.distance,
             "ruv_alpha": args.alpha,
             "ruv_num_permutations": args.num_permutations,
-            "ruv_probe_max_iter": args.probe_max_iter,
         }
     )
     if args.forget_count is not None:
@@ -141,12 +125,14 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
     return cfg
 
 
-def _resolve_checkpoint(path_value: str) -> Path:
+def _resolve_checkpoint(path_value: str, config: dict, role: str) -> Path:
     """
     Resolve checkpoint path from file or directory.
 
     Args:
         path_value: File or directory path.
+        config: Runtime config.
+        role: Checkpoint role for log/error messages.
 
     Returns:
         Checkpoint path.
@@ -155,7 +141,13 @@ def _resolve_checkpoint(path_value: str) -> Path:
     if path.is_file():
         return path
     if not path.exists():
-        raise FileNotFoundError(f"Unlearned model path does not exist: {path}")
+        raise FileNotFoundError(f"{role} model path does not exist: {path}")
+
+    exact_name = f"{config.get('model_name', 'resnet18')}_{config.get('dataset', 'cifar10')}.pt"
+    exact_path = path / exact_name
+    if exact_path.is_file():
+        return exact_path
+
     candidates = sorted(path.glob("*.pt")) + sorted(path.glob("*.pth")) + sorted(path.glob("*.bin"))
     if not candidates:
         raise FileNotFoundError(f"No checkpoint found under: {path}")
@@ -182,14 +174,15 @@ def _extract_state_dict(state_obj):
     return {k[len("module."):] if k.startswith("module.") else k: v for k, v in state_obj.items()}
 
 
-def _load_unlearned_model(config: dict, dataset: UnlearningDataset, checkpoint_path: Path):
+def _load_model(config: dict, dataset: UnlearningDataset, checkpoint_path: Path, label: str):
     """
-    Load M_u from checkpoint.
+    Load a model from checkpoint.
 
     Args:
         config: Runtime config.
         dataset: Dataset manager.
         checkpoint_path: Checkpoint path.
+        label: Log label, such as M_s or M_u.
 
     Returns:
         Loaded model.
@@ -202,11 +195,11 @@ def _load_unlearned_model(config: dict, dataset: UnlearningDataset, checkpoint_p
     )
     state = torch.load(str(checkpoint_path), map_location="cpu")
     missing, unexpected = model.load_state_dict(_extract_state_dict(state), strict=False)
-    print(f"[RUV_TEST] Loaded M_u checkpoint: {checkpoint_path}")
+    print(f"[RUV_TEST] Loaded {label} checkpoint: {checkpoint_path}")
     if missing:
-        print(f"[RUV_TEST][Load] Missing keys count: {len(missing)}")
+        print(f"[RUV_TEST][Load][{label}] Missing keys count: {len(missing)}")
     if unexpected:
-        print(f"[RUV_TEST][Load] Unexpected keys count: {len(unexpected)}")
+        print(f"[RUV_TEST][Load][{label}] Unexpected keys count: {len(unexpected)}")
     return model
 
 
@@ -245,14 +238,17 @@ def main() -> None:
     pprint(config)
 
     dataset = UnlearningDataset(config)
-    checkpoint_path = _resolve_checkpoint(args.unlearned_model_path)
-    model_u = _load_unlearned_model(config, dataset, checkpoint_path)
+    original_checkpoint_path = _resolve_checkpoint(args.original_model_path, config, role="Original")
+    unlearned_checkpoint_path = _resolve_checkpoint(args.unlearned_model_path, config, role="Unlearned")
+    model_s = _load_model(config, dataset, original_checkpoint_path, label="M_s")
+    model_u = _load_model(config, dataset, unlearned_checkpoint_path, label="M_u")
 
     verifier = RUVVerifier(config=config)
-    result = verifier.verify(model_before=None, model_after=model_u, dataset=dataset)
+    result = verifier.verify(model_before=model_s, model_after=model_u, dataset=dataset)
     result.update(
         {
-            "unlearned_model_path": str(checkpoint_path),
+            "original_model_path": str(original_checkpoint_path),
+            "unlearned_model_path": str(unlearned_checkpoint_path),
             "model_name": config.get("model_name", "resnet18"),
             "dataset": dataset.dataset_name,
             "split_mode": config.get("split_mode", "random"),
