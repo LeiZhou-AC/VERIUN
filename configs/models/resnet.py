@@ -173,19 +173,21 @@ class ResNetWrapper(nn.Module):
         layers: Optional[Sequence[str]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Extract pooled representation states from selected hierarchy stages.
+        Extract representation states from selected hierarchy stages.
 
         Args:
             x: Input image batch.
             layers: Stage names to collect. Preferred architecture-agnostic
-                names are early/middle/late/prelogit. ResNet-specific aliases
-                layer1/layer2/layer3/layer4/penultimate are also supported.
+                names are stem/early/middle/late/prelogit. ResNet-specific
+                aliases layer1/layer2/layer3/layer4/penultimate are also
+                supported.
 
         Returns:
             Mapping from requested stage name to flattened representation tensor.
         """
         requested = [str(name).lower() for name in (layers or ["prelogit"])]
         stage_to_resnet_layers = {
+            "stem": ["stem"],
             "early": ["layer1"],
             "middle": ["layer2", "layer3"],
             "late": ["layer4"],
@@ -211,14 +213,14 @@ class ResNetWrapper(nn.Module):
         for index, module in enumerate(self.backbone):
             h = module(h)
             layer_name = {
+                3: "stem",
                 4: "layer1",
                 5: "layer2",
                 6: "layer3",
                 7: "layer4",
             }.get(index)
             if layer_name in needed_resnet_layers:
-                pooled = nn.functional.adaptive_avg_pool2d(h, output_size=(1, 1))
-                layer_outputs[layer_name] = torch.flatten(pooled, 1)
+                layer_outputs[layer_name] = self._pool_representation_stage(h, layer_name)
 
         if "penultimate" in needed_resnet_layers:
             layer_outputs["penultimate"] = torch.flatten(h, 1)
@@ -232,6 +234,31 @@ class ResNetWrapper(nn.Module):
                 normalized = [nn.functional.normalize(tensor, p=2, dim=1) for tensor in tensors]
                 stage_outputs[stage] = torch.cat(normalized, dim=1)
         return stage_outputs
+
+    def _pool_representation_stage(self, features: torch.Tensor, layer_name: str) -> torch.Tensor:
+        """
+        Convert a ResNet feature map into a stage representation.
+
+        Low and middle stages keep coarse spatial grids for sample-level
+        instance details. High semantic stages use global pooling.
+
+        Args:
+            features: Feature map from a ResNet stage.
+            layer_name: ResNet stage name.
+
+        Returns:
+            Flattened representation tensor.
+        """
+        grid_sizes = {
+            "stem": (4, 4),
+            "layer1": (4, 4),
+            "layer2": (4, 4),
+            "layer3": (2, 2),
+            "layer4": (1, 1),
+        }
+        output_size = grid_sizes.get(layer_name, (1, 1))
+        pooled = nn.functional.adaptive_avg_pool2d(features, output_size=output_size)
+        return torch.flatten(pooled, 1)
 
     def get_classifier(self) -> nn.Module:
         """
