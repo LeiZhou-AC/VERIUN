@@ -1,8 +1,8 @@
-"""Representation Update Verification (RUV).
+"""Representation Unlearning Verification (RUV).
 
-RUV verifies whether an unlearning method produces target-specific
-representation updates on the forget set.  It compares the same samples before
-and after unlearning, then uses retained samples as a background-drift control.
+RUV supports representation-shift verification and RMS-kNN membership-footprint
+verification.  The RMS-kNN path checks whether forgotten samples become less
+member-like in representation space after unlearning.
 """
 
 from __future__ import annotations
@@ -12,14 +12,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.stats import mannwhitneyu
+from scipy.stats import mannwhitneyu, wilcoxon
 from torch.utils.data import DataLoader, Subset
 
 from verification.base_verifier import BaseVerifier
 
 
 class RUVVerifier(BaseVerifier):
-    """Representation Update Verification with the Representation Update Gap."""
+    """Representation verifier for shift and RMS-kNN membership evidence."""
 
     def __init__(self, config: Optional[Dict] = None):
         """
@@ -42,8 +42,14 @@ class RUVVerifier(BaseVerifier):
         self.num_permutations = int(self.config.get("ruv_num_permutations", 100))
         self.distance = str(self.config.get("ruv_distance", "cosine")).lower()
         self.mode = str(self.config.get("ruv_mode", "auto")).lower()
+        self.metric = str(self.config.get("ruv_metric", "rms_knn")).lower()
         self.primary_layers = self._parse_layers(self.config.get("ruv_layers", None))
         self.control_layers = self._parse_layers(self.config.get("ruv_control_layers", None))
+        self.knn_k = int(self.config.get("ruv_knn_k", 10))
+        self.knn_chunk_size = int(self.config.get("ruv_knn_chunk_size", 256))
+        self.rms_reference_size = int(self.config.get("ruv_rms_reference_size", 10000))
+        self.rms_test_reference_size = int(self.config.get("ruv_rms_test_reference_size", 10000))
+        self.rms_control_size = int(self.config.get("ruv_rms_control_size", 0))
 
     def _parse_layers(self, raw_layers) -> Optional[List[str]]:
         """
@@ -215,6 +221,58 @@ class RUVVerifier(BaseVerifier):
             raise ValueError("No features were extracted for at least one RUV layer.")
         return {layer: torch.cat(chunks, dim=0).numpy() for layer, chunks in features.items()}
 
+    def extract_feature_label_dict(self, model, data_subset, layers: Sequence[str]) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+        """
+        Extract selected representation states and labels.
+
+        Args:
+            model: Model exposing extract_layer_representations or extract_representation.
+            data_subset: Dataset or subset.
+            layers: Representation stages to collect.
+
+        Returns:
+            Tuple of feature dictionary and integer labels.
+        """
+        layers = self._deduplicate_layers(layers)
+        loader = DataLoader(
+            data_subset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.device.type == "cuda",
+        )
+        model = model.to(self.device)
+        model.eval()
+
+        features = {layer: [] for layer in layers}
+        labels = []
+        with torch.no_grad():
+            for batch in loader:
+                x = batch[0].to(self.device)
+                y = batch[1]
+                if hasattr(model, "extract_layer_representations"):
+                    reps_by_layer = model.extract_layer_representations(x, layers=layers)
+                else:
+                    if any(layer not in {"penultimate", "prelogit"} for layer in layers):
+                        raise AttributeError(
+                            "This model does not expose extract_layer_representations; "
+                            "only prelogit RUV is available through extract_representation."
+                        )
+                    reps_by_layer = {layer: model.extract_representation(x) for layer in layers}
+
+                for layer in layers:
+                    reps = torch.flatten(reps_by_layer[layer], start_dim=1)
+                    features[layer].append(reps.detach().cpu())
+                labels.append(torch.as_tensor(y).detach().cpu().long())
+
+        if any(not chunks for chunks in features.values()):
+            raise ValueError("No features were extracted for at least one RUV layer.")
+        if not labels:
+            raise ValueError("No labels were extracted for RMS-kNN.")
+        feature_dict = {layer: torch.cat(chunks, dim=0).numpy() for layer, chunks in features.items()}
+        label_array = torch.cat(labels, dim=0).numpy().astype(np.int64)
+        return feature_dict, label_array
+
     def compute_update_scores_from_features(
         self,
         z_before: np.ndarray,
@@ -369,6 +427,387 @@ class RUVVerifier(BaseVerifier):
             "null_rug_quantile": epsilon,
         }
 
+    def _sample_local_indices(self, total_size: int, sample_size: int, rng: np.random.Generator) -> List[int]:
+        """
+        Sample local subset indices.
+
+        Args:
+            total_size: Dataset size.
+            sample_size: Requested sample size. Non-positive means use all.
+            rng: NumPy random generator.
+
+        Returns:
+            Local indices.
+        """
+        if total_size <= 0:
+            return []
+        if sample_size <= 0 or sample_size >= total_size:
+            return list(range(total_size))
+        return rng.choice(total_size, size=sample_size, replace=False).tolist()
+
+    def _build_rms_knn_subsets(self, dataset) -> Dict[str, Subset]:
+        """
+        Build target and reference subsets for RMS-kNN.
+
+        Args:
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Dictionary with D_u target, D_r control, D_r reference, and D_test reference.
+        """
+        forget_set = dataset.get_unlearning_set()
+        retained_set = dataset.get_retained_set()
+        test_set = dataset.get_test_set()
+
+        if len(forget_set) <= 0:
+            raise ValueError("D_u is empty; RMS-kNN requires at least one forget sample.")
+        if len(retained_set) < 2:
+            raise ValueError("D_r is too small for RMS-kNN control/reference splitting.")
+        if len(test_set) <= 0:
+            raise ValueError("D_test is empty; RMS-kNN requires a non-member reference set.")
+
+        rng = np.random.default_rng(self.seed)
+        retained_perm = rng.permutation(len(retained_set)).tolist()
+        control_size = self.rms_control_size if self.rms_control_size > 0 else len(forget_set)
+        control_size = min(control_size, max(1, len(retained_set) // 2))
+        control_indices = retained_perm[:control_size]
+        retained_reference_candidates = retained_perm[control_size:]
+        if not retained_reference_candidates:
+            raise ValueError("No retained samples left for RMS-kNN member reference.")
+
+        if self.rms_reference_size > 0:
+            retained_reference_indices = retained_reference_candidates[: self.rms_reference_size]
+        else:
+            retained_reference_indices = retained_reference_candidates
+
+        test_reference_indices = self._sample_local_indices(
+            total_size=len(test_set),
+            sample_size=self.rms_test_reference_size,
+            rng=rng,
+        )
+        return {
+            "forget_target": forget_set,
+            "retained_control": Subset(retained_set, control_indices),
+            "retained_reference": Subset(retained_set, retained_reference_indices),
+            "test_reference": Subset(test_set, test_reference_indices),
+        }
+
+    def _normalize_np(self, features: np.ndarray) -> np.ndarray:
+        """
+        L2-normalize feature rows.
+
+        Args:
+            features: Feature matrix.
+
+        Returns:
+            Row-normalized feature matrix.
+        """
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        return features / np.clip(norms, a_min=1e-12, a_max=None)
+
+    def _mean_topk_cosine(self, query: np.ndarray, reference: np.ndarray, k: int) -> np.ndarray:
+        """
+        Compute mean top-k cosine similarity in chunks.
+
+        Args:
+            query: Normalized query feature matrix.
+            reference: Normalized reference feature matrix.
+            k: Number of nearest neighbors.
+
+        Returns:
+            Mean top-k similarity per query.
+        """
+        if len(reference) == 0:
+            raise ValueError("RMS-kNN received an empty reference feature set.")
+        k_eff = min(max(1, int(k)), len(reference))
+        scores = []
+        chunk_size = max(1, self.knn_chunk_size)
+        for start in range(0, len(query), chunk_size):
+            sims = query[start : start + chunk_size] @ reference.T
+            if k_eff == len(reference):
+                topk = sims
+            else:
+                topk_idx = np.argpartition(sims, -k_eff, axis=1)[:, -k_eff:]
+                topk = np.take_along_axis(sims, topk_idx, axis=1)
+            scores.append(np.mean(topk, axis=1))
+        return np.concatenate(scores, axis=0)
+
+    def _compute_rms_knn_scores(
+        self,
+        target_features: np.ndarray,
+        target_labels: np.ndarray,
+        member_features: np.ndarray,
+        member_labels: np.ndarray,
+        nonmember_features: np.ndarray,
+        nonmember_labels: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute same-class Representation Membership Score with kNN.
+
+        Args:
+            target_features: Target features.
+            target_labels: Target labels.
+            member_features: Member-reference features from D_r.
+            member_labels: Member-reference labels.
+            nonmember_features: Non-member reference features from D_test.
+            nonmember_labels: Non-member reference labels.
+
+        Returns:
+            Dictionary with RMS, member affinity, and non-member affinity.
+        """
+        target_norm = self._normalize_np(target_features)
+        member_norm = self._normalize_np(member_features)
+        nonmember_norm = self._normalize_np(nonmember_features)
+        target_labels = target_labels.astype(np.int64)
+        member_labels = member_labels.astype(np.int64)
+        nonmember_labels = nonmember_labels.astype(np.int64)
+
+        rms_scores = np.zeros(len(target_norm), dtype=np.float64)
+        member_affinity = np.zeros(len(target_norm), dtype=np.float64)
+        nonmember_affinity = np.zeros(len(target_norm), dtype=np.float64)
+        for label in np.unique(target_labels):
+            target_mask = target_labels == label
+            member_mask = member_labels == label
+            nonmember_mask = nonmember_labels == label
+            if not np.any(member_mask):
+                raise ValueError(f"RMS-kNN has no same-class D_r reference for label={label}.")
+            if not np.any(nonmember_mask):
+                raise ValueError(f"RMS-kNN has no same-class D_test reference for label={label}.")
+
+            train_sim = self._mean_topk_cosine(
+                query=target_norm[target_mask],
+                reference=member_norm[member_mask],
+                k=self.knn_k,
+            )
+            test_sim = self._mean_topk_cosine(
+                query=target_norm[target_mask],
+                reference=nonmember_norm[nonmember_mask],
+                k=self.knn_k,
+            )
+            member_affinity[target_mask] = train_sim
+            nonmember_affinity[target_mask] = test_sim
+            rms_scores[target_mask] = train_sim - test_sim
+
+        return {
+            "rms": rms_scores,
+            "member_affinity": member_affinity,
+            "nonmember_affinity": nonmember_affinity,
+        }
+
+    def _safe_wilcoxon_greater(self, values: np.ndarray) -> Optional[float]:
+        """
+        Compute a one-sided Wilcoxon p-value when possible.
+
+        Args:
+            values: Paired differences.
+
+        Returns:
+            p-value or None when the test is undefined.
+        """
+        try:
+            if np.allclose(values, 0.0):
+                return None
+            return float(wilcoxon(values, alternative="greater").pvalue)
+        except ValueError:
+            return None
+
+    def _evaluate_rms_drop(
+        self,
+        target_before: np.ndarray,
+        target_after: np.ndarray,
+        control_before: np.ndarray,
+        control_after: np.ndarray,
+    ) -> Dict:
+        """
+        Evaluate target-specific RMS-kNN membership drop.
+
+        Args:
+            target_before: D_u RMS under M_s.
+            target_after: D_u RMS under M_u.
+            control_before: D_r-control RMS under M_s.
+            control_after: D_r-control RMS under M_u.
+
+        Returns:
+            Metric summary.
+        """
+        target_drop = target_before - target_after
+        control_drop = control_before - control_after
+        drop_gap = self._compute_rug(target_drop, control_drop)
+        p_value = self._compute_p_value(target_drop, control_drop)
+        epsilon, null_gaps = self._permutation_test(target_drop, control_drop)
+        target_drop_p_value = self._safe_wilcoxon_greater(target_drop)
+        rejected = bool(p_value < self.alpha and drop_gap > epsilon and np.mean(target_drop) > 0.0)
+        return {
+            "rms_before": self._summarize_scores(target_before),
+            "rms_after": self._summarize_scores(target_after),
+            "rms_drop": self._summarize_scores(target_drop),
+            "control_rms_before": self._summarize_scores(control_before),
+            "control_rms_after": self._summarize_scores(control_after),
+            "control_rms_drop": self._summarize_scores(control_drop),
+            "rms_drop_gap": drop_gap,
+            "p_value": p_value,
+            "target_drop_p_value": target_drop_p_value,
+            "epsilon": epsilon,
+            "rejected": rejected,
+            "decision": "membership_footprint_drop_detected" if rejected else "no_target_specific_membership_drop",
+            "null_gap_mean": float(np.mean(null_gaps)) if null_gaps else None,
+            "null_gap_std": float(np.std(null_gaps)) if null_gaps else None,
+            "null_gap_quantile": epsilon,
+        }
+
+    def verify_rms_knn(self, model_before, model_after, dataset) -> Dict:
+        """
+        Run RMS-kNN sample-level representation membership verification.
+
+        Args:
+            model_before: Source model M_s before unlearning.
+            model_after: Unlearned model M_u to verify.
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Verification summary dictionary.
+        """
+        if model_before is None:
+            raise ValueError("RMS-kNN requires model_before as the original trained model M_s.")
+        if model_after is None:
+            raise ValueError("RMS-kNN requires model_after as the unlearned model M_u.")
+
+        granularity, primary_layers, control_layers = self._resolve_layer_plan()
+        all_layers = self._deduplicate_layers(primary_layers + control_layers)
+        subsets = self._build_rms_knn_subsets(dataset)
+
+        print("[RUV][RMS-kNN] ===== Start Representation Membership Verification =====")
+        print(
+            f"[RUV][RMS-kNN] Setup: granularity={granularity}, stages={all_layers}, "
+            f"k={self.knn_k}, D_u={len(subsets['forget_target'])}, "
+            f"D_r_control={len(subsets['retained_control'])}, "
+            f"D_r_ref={len(subsets['retained_reference'])}, "
+            f"D_test_ref={len(subsets['test_reference'])}, permutations={self.num_permutations}"
+        )
+
+        print("[RUV][RMS-kNN] Extracting M_s features...")
+        du_before, du_labels = self.extract_feature_label_dict(model_before, subsets["forget_target"], all_layers)
+        drc_before, drc_labels = self.extract_feature_label_dict(model_before, subsets["retained_control"], all_layers)
+        drr_before, drr_labels = self.extract_feature_label_dict(model_before, subsets["retained_reference"], all_layers)
+        dtest_before, dtest_labels = self.extract_feature_label_dict(model_before, subsets["test_reference"], all_layers)
+
+        print("[RUV][RMS-kNN] Extracting M_u features...")
+        du_after, du_labels_after = self.extract_feature_label_dict(model_after, subsets["forget_target"], all_layers)
+        drc_after, drc_labels_after = self.extract_feature_label_dict(model_after, subsets["retained_control"], all_layers)
+        drr_after, drr_labels_after = self.extract_feature_label_dict(model_after, subsets["retained_reference"], all_layers)
+        dtest_after, dtest_labels_after = self.extract_feature_label_dict(model_after, subsets["test_reference"], all_layers)
+
+        for name, before_labels, after_labels in [
+            ("D_u", du_labels, du_labels_after),
+            ("D_r_control", drc_labels, drc_labels_after),
+            ("D_r_ref", drr_labels, drr_labels_after),
+            ("D_test_ref", dtest_labels, dtest_labels_after),
+        ]:
+            if not np.array_equal(before_labels, after_labels):
+                raise ValueError(f"Label order changed between M_s and M_u extraction for {name}.")
+
+        stage_results = {}
+        du_before_scores = {}
+        du_after_scores = {}
+        dr_before_scores = {}
+        dr_after_scores = {}
+        for layer in all_layers:
+            du_rms_before = self._compute_rms_knn_scores(
+                du_before[layer], du_labels, drr_before[layer], drr_labels, dtest_before[layer], dtest_labels
+            )["rms"]
+            du_rms_after = self._compute_rms_knn_scores(
+                du_after[layer], du_labels, drr_after[layer], drr_labels, dtest_after[layer], dtest_labels
+            )["rms"]
+            dr_rms_before = self._compute_rms_knn_scores(
+                drc_before[layer], drc_labels, drr_before[layer], drr_labels, dtest_before[layer], dtest_labels
+            )["rms"]
+            dr_rms_after = self._compute_rms_knn_scores(
+                drc_after[layer], drc_labels, drr_after[layer], drr_labels, dtest_after[layer], dtest_labels
+            )["rms"]
+
+            du_before_scores[layer] = du_rms_before
+            du_after_scores[layer] = du_rms_after
+            dr_before_scores[layer] = dr_rms_before
+            dr_after_scores[layer] = dr_rms_after
+            stage_results[layer] = self._evaluate_rms_drop(
+                target_before=du_rms_before,
+                target_after=du_rms_after,
+                control_before=dr_rms_before,
+                control_after=dr_rms_after,
+            )
+            print(
+                f"[RUV][RMS-kNN][Stage:{layer}] "
+                f"drop={stage_results[layer]['rms_drop']['mean']:.6f} "
+                f"control_drop={stage_results[layer]['control_rms_drop']['mean']:.6f} "
+                f"gap={stage_results[layer]['rms_drop_gap']:.6f} "
+                f"p_value={stage_results[layer]['p_value']:.6g} "
+                f"epsilon={stage_results[layer]['epsilon']:.6f}"
+            )
+
+        primary_before = np.mean(np.stack([du_before_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_after = np.mean(np.stack([du_after_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_before = np.mean(np.stack([dr_before_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_after = np.mean(np.stack([dr_after_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_result = self._evaluate_rms_drop(
+            target_before=primary_before,
+            target_after=primary_after,
+            control_before=primary_control_before,
+            control_after=primary_control_after,
+        )
+
+        result = {
+            "status": "ok",
+            "method": "rms_knn",
+            "full_name": "Representation Membership Score with kNN",
+            "representation_name": "Model Representation State",
+            "metric": "RMS-kNN Membership Drop Gap",
+            "granularity": granularity,
+            "primary_stages": primary_layers,
+            "control_stages": control_layers,
+            "knn_k": self.knn_k,
+            "rms_reference_size": len(subsets["retained_reference"]),
+            "rms_test_reference_size": len(subsets["test_reference"]),
+            "rms_control_size": len(subsets["retained_control"]),
+            "rms_drop_gap": primary_result["rms_drop_gap"],
+            "p_value": primary_result["p_value"],
+            "target_drop_p_value": primary_result["target_drop_p_value"],
+            "epsilon": primary_result["epsilon"],
+            "alpha": self.alpha,
+            "rejected": primary_result["rejected"],
+            "decision": primary_result["decision"],
+            "interpretation": (
+                "D_u shows a target-specific representation membership footprint drop."
+                if primary_result["rejected"]
+                else "No statistically significant target-specific representation membership drop was detected."
+            ),
+            "rms_before": primary_result["rms_before"],
+            "rms_after": primary_result["rms_after"],
+            "rms_drop": primary_result["rms_drop"],
+            "control_rms_before": primary_result["control_rms_before"],
+            "control_rms_after": primary_result["control_rms_after"],
+            "control_rms_drop": primary_result["control_rms_drop"],
+            "stage_results": stage_results,
+            "num_forget": int(len(primary_before)),
+            "num_retained_control": int(len(primary_control_before)),
+            "num_permutations": self.num_permutations,
+            "null_gap_mean": primary_result["null_gap_mean"],
+            "null_gap_std": primary_result["null_gap_std"],
+            "null_gap_quantile": primary_result["null_gap_quantile"],
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+        }
+
+        print(
+            f"[RUV][RMS-kNN][Primary] drop={result['rms_drop']['mean']:.6f} "
+            f"control_drop={result['control_rms_drop']['mean']:.6f} "
+            f"gap={result['rms_drop_gap']:.6f} p_value={result['p_value']:.6g} "
+            f"epsilon={result['epsilon']:.6f}"
+        )
+        print(f"[RUV][RMS-kNN] decision={result['decision']}")
+        print("[RUV][RMS-kNN] ===== RMS-kNN Finished =====")
+        return result
+
     def verify(self, model_before, model_after, dataset):
         """
         Run Representation Update Verification.
@@ -385,6 +824,8 @@ class RUVVerifier(BaseVerifier):
             raise ValueError("RUV requires model_before as the original trained model M_s.")
         if model_after is None:
             raise ValueError("RUV requires model_after as the unlearned model M_u.")
+        if self.metric in {"rms", "rms_knn", "rms-knn", "membership", "membership_knn"}:
+            return self.verify_rms_knn(model_before, model_after, dataset)
 
         granularity, primary_layers, control_layers = self._resolve_layer_plan()
         all_layers = self._deduplicate_layers(primary_layers + control_layers)

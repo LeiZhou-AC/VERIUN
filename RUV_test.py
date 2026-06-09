@@ -76,6 +76,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--in-channels", type=int, default=3)
     parser.add_argument("--data-path", type=str, default="datasets")
     parser.add_argument("--allow-download", action="store_true")
+    parser.add_argument("--augmentations", action="store_true")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
@@ -91,10 +92,15 @@ def _build_args() -> argparse.Namespace:
 
     parser.add_argument("--original-model-path", type=str, default="save/weights/trained")
     parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned")
+    parser.add_argument("--ruv-metric", type=str, default="rms_knn", choices=["shift", "rms_knn"])
     parser.add_argument("--ruv-mode", type=str, default="auto", choices=["auto", "class", "sample"])
     parser.add_argument("--ruv-layers", type=str, default="")
     parser.add_argument("--ruv-control-layers", type=str, default="")
     parser.add_argument("--distance", type=str, default="cosine", choices=["cosine", "l2"])
+    parser.add_argument("--knn-k", type=int, default=10)
+    parser.add_argument("--rms-reference-size", type=int, default=10000)
+    parser.add_argument("--rms-test-reference-size", type=int, default=10000)
+    parser.add_argument("--rms-control-size", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--num-permutations", type=int, default=100)
     parser.add_argument("--result-dir", type=str, default="save/results/ruv")
@@ -122,6 +128,7 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "in_channels": args.in_channels,
             "data_path": args.data_path,
             "allow_download": bool(args.allow_download),
+            "augmentations": bool(args.augmentations),
             "batch_size": args.batch_size,
             "num_workers": args.num_workers,
             "device": args.device,
@@ -131,8 +138,13 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "split_seed": args.split_seed,
             "forget_manifest_path": args.forget_manifest_path,
             "forget_manifest_mode": args.forget_manifest_mode,
+            "ruv_metric": args.ruv_metric,
             "ruv_mode": args.ruv_mode,
             "ruv_distance": args.distance,
+            "ruv_knn_k": args.knn_k,
+            "ruv_rms_reference_size": args.rms_reference_size,
+            "ruv_rms_test_reference_size": args.rms_test_reference_size,
+            "ruv_rms_control_size": args.rms_control_size,
             "ruv_alpha": args.alpha,
             "ruv_num_permutations": args.num_permutations,
         }

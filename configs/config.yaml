@@ -13,6 +13,11 @@ alpha: 1.0
 "lambda": 0.5
 
 ruv_distance: cosine
+ruv_metric: rms_knn
 ruv_mode: auto
+ruv_knn_k: 10
+ruv_rms_reference_size: 10000
+ruv_rms_test_reference_size: 10000
+ruv_rms_control_size: 0
 ruv_alpha: 0.05
 ruv_num_permutations: 100
