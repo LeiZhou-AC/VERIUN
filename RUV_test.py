@@ -92,7 +92,7 @@ def _build_args() -> argparse.Namespace:
 
     parser.add_argument("--original-model-path", type=str, default="save/weights/trained")
     parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned")
-    parser.add_argument("--ruv-metric", type=str, default="rms_knn", choices=["shift", "rms_knn"])
+    parser.add_argument("--ruv-metric", type=str, default="ras", choices=["shift", "rms_knn", "ras"])
     parser.add_argument("--ruv-mode", type=str, default="auto", choices=["auto", "class", "sample"])
     parser.add_argument("--ruv-layers", type=str, default="")
     parser.add_argument("--ruv-control-layers", type=str, default="")
@@ -101,6 +101,10 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--rms-reference-size", type=int, default=10000)
     parser.add_argument("--rms-test-reference-size", type=int, default=10000)
     parser.add_argument("--rms-control-size", type=int, default=0)
+    parser.add_argument("--ras-num-views", type=int, default=8)
+    parser.add_argument("--ras-crop-padding", type=int, default=4)
+    parser.add_argument("--ras-hflip-prob", type=float, default=0.5)
+    parser.add_argument("--ras-noise-std", type=float, default=0.0)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--num-permutations", type=int, default=100)
     parser.add_argument("--result-dir", type=str, default="save/results/ruv")
@@ -145,6 +149,10 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "ruv_rms_reference_size": args.rms_reference_size,
             "ruv_rms_test_reference_size": args.rms_test_reference_size,
             "ruv_rms_control_size": args.rms_control_size,
+            "ruv_ras_num_views": args.ras_num_views,
+            "ruv_ras_crop_padding": args.ras_crop_padding,
+            "ruv_ras_hflip_prob": args.ras_hflip_prob,
+            "ruv_ras_noise_std": args.ras_noise_std,
             "ruv_alpha": args.alpha,
             "ruv_num_permutations": args.num_permutations,
         }

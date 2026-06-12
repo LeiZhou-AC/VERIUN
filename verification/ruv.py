@@ -1,8 +1,7 @@
 """Representation Unlearning Verification (RUV).
 
-RUV supports representation-shift verification and RMS-kNN membership-footprint
-verification.  The RMS-kNN path checks whether forgotten samples become less
-member-like in representation space after unlearning.
+RUV supports representation-shift verification, RMS-kNN membership-footprint
+verification, and representation augmentation stability verification.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from verification.base_verifier import BaseVerifier
 
 
 class RUVVerifier(BaseVerifier):
-    """Representation verifier for shift and RMS-kNN membership evidence."""
+    """Representation verifier for shift, RMS-kNN, and RAS evidence."""
 
     def __init__(self, config: Optional[Dict] = None):
         """
@@ -50,6 +49,10 @@ class RUVVerifier(BaseVerifier):
         self.rms_reference_size = int(self.config.get("ruv_rms_reference_size", 10000))
         self.rms_test_reference_size = int(self.config.get("ruv_rms_test_reference_size", 10000))
         self.rms_control_size = int(self.config.get("ruv_rms_control_size", 0))
+        self.ras_num_views = int(self.config.get("ruv_ras_num_views", 8))
+        self.ras_crop_padding = int(self.config.get("ruv_ras_crop_padding", 4))
+        self.ras_hflip_prob = float(self.config.get("ruv_ras_hflip_prob", 0.5))
+        self.ras_noise_std = float(self.config.get("ruv_ras_noise_std", 0.0))
 
     def _parse_layers(self, raw_layers) -> Optional[List[str]]:
         """
@@ -655,6 +658,294 @@ class RUVVerifier(BaseVerifier):
             "null_gap_quantile": epsilon,
         }
 
+    def _augment_tensor_batch(self, x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+        """
+        Apply weak tensor-level augmentations for RAS.
+
+        Args:
+            x: Input tensor batch.
+            generator: CPU random generator controlling augmentation choices.
+
+        Returns:
+            Augmented tensor batch.
+        """
+        augmented = x
+        if self.ras_crop_padding > 0:
+            _, _, height, width = augmented.shape
+            padded = F.pad(
+                augmented,
+                pad=(self.ras_crop_padding, self.ras_crop_padding, self.ras_crop_padding, self.ras_crop_padding),
+                mode="reflect",
+            )
+            crops = []
+            max_offset = 2 * self.ras_crop_padding
+            for item_idx in range(augmented.shape[0]):
+                top = int(torch.randint(0, max_offset + 1, (1,), generator=generator).item())
+                left = int(torch.randint(0, max_offset + 1, (1,), generator=generator).item())
+                crops.append(padded[item_idx : item_idx + 1, :, top : top + height, left : left + width])
+            augmented = torch.cat(crops, dim=0)
+
+        if self.ras_hflip_prob > 0:
+            flips = torch.rand(augmented.shape[0], generator=generator) < self.ras_hflip_prob
+            if torch.any(flips):
+                augmented = augmented.clone()
+                augmented[flips.to(augmented.device)] = torch.flip(augmented[flips.to(augmented.device)], dims=[3])
+
+        if self.ras_noise_std > 0:
+            noise = torch.randn(
+                augmented.shape,
+                generator=generator,
+                device="cpu",
+                dtype=augmented.detach().cpu().dtype,
+            ).to(augmented.device)
+            augmented = augmented + float(self.ras_noise_std) * noise
+
+        return augmented
+
+    def _pairwise_stability_from_views(self, view_features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute pairwise cosine representation stability from augmented views.
+
+        Args:
+            view_features: List of feature matrices with shape [batch, dim].
+
+        Returns:
+            Per-sample mean pairwise cosine stability.
+        """
+        if len(view_features) < 2:
+            raise ValueError("RAS requires at least two augmented views.")
+        normalized = [F.normalize(features.float(), p=2, dim=1) for features in view_features]
+        pair_scores = []
+        for i in range(len(normalized)):
+            for j in range(i + 1, len(normalized)):
+                pair_scores.append(torch.sum(normalized[i] * normalized[j], dim=1))
+        return torch.stack(pair_scores, dim=0).mean(dim=0)
+
+    def extract_ras_scores(self, model, data_subset, layers: Sequence[str], seed_offset: int) -> Dict[str, np.ndarray]:
+        """
+        Extract Representation Augmentation Stability scores.
+
+        Args:
+            model: Model exposing extract_layer_representations or extract_representation.
+            data_subset: Dataset or subset.
+            layers: Representation stages to collect.
+            seed_offset: Offset used to make augmentations reproducible.
+
+        Returns:
+            Mapping from stage name to per-sample RAS scores.
+        """
+        if self.ras_num_views < 2:
+            raise ValueError("ruv_ras_num_views must be at least 2.")
+
+        layers = self._deduplicate_layers(layers)
+        loader = DataLoader(
+            data_subset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.device.type == "cuda",
+        )
+        model = model.to(self.device)
+        model.eval()
+
+        scores = {layer: [] for layer in layers}
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.seed + int(seed_offset))
+
+        with torch.no_grad():
+            for batch in loader:
+                x = batch[0].to(self.device)
+                view_features = {layer: [] for layer in layers}
+                for _ in range(self.ras_num_views):
+                    augmented = self._augment_tensor_batch(x, generator)
+                    if hasattr(model, "extract_layer_representations"):
+                        reps_by_layer = model.extract_layer_representations(augmented, layers=layers)
+                    else:
+                        if any(layer not in {"penultimate", "prelogit"} for layer in layers):
+                            raise AttributeError(
+                                "This model does not expose extract_layer_representations; "
+                                "only prelogit RAS is available through extract_representation."
+                            )
+                        reps_by_layer = {layer: model.extract_representation(augmented) for layer in layers}
+                    for layer in layers:
+                        reps = torch.flatten(reps_by_layer[layer], start_dim=1)
+                        view_features[layer].append(reps.detach().cpu())
+
+                for layer in layers:
+                    batch_scores = self._pairwise_stability_from_views(view_features[layer])
+                    scores[layer].append(batch_scores)
+
+        if any(not chunks for chunks in scores.values()):
+            raise ValueError("No RAS scores were extracted for at least one stage.")
+        return {layer: torch.cat(chunks, dim=0).numpy() for layer, chunks in scores.items()}
+
+    def _evaluate_ras_drop(
+        self,
+        target_before: np.ndarray,
+        target_after: np.ndarray,
+        control_before: np.ndarray,
+        control_after: np.ndarray,
+    ) -> Dict:
+        """
+        Evaluate target-specific representation stability drop.
+
+        Args:
+            target_before: D_u RAS under M_s.
+            target_after: D_u RAS under M_u.
+            control_before: D_r' RAS under M_s.
+            control_after: D_r' RAS under M_u.
+
+        Returns:
+            Metric summary.
+        """
+        target_drop = target_before - target_after
+        control_drop = control_before - control_after
+        gap = self._compute_rug(target_drop, control_drop)
+        p_value = self._compute_p_value(target_drop, control_drop)
+        epsilon, null_gaps = self._permutation_test(target_drop, control_drop)
+        target_drop_p_value = self._safe_wilcoxon_greater(target_drop)
+        rejected = bool(p_value < self.alpha and gap > epsilon and np.mean(target_drop) > 0.0)
+        return {
+            "ras_before": self._summarize_scores(target_before),
+            "ras_after": self._summarize_scores(target_after),
+            "ras_drop": self._summarize_scores(target_drop),
+            "control_ras_before": self._summarize_scores(control_before),
+            "control_ras_after": self._summarize_scores(control_after),
+            "control_ras_drop": self._summarize_scores(control_drop),
+            "ras_gap": gap,
+            "p_value": p_value,
+            "target_drop_p_value": target_drop_p_value,
+            "epsilon": epsilon,
+            "rejected": rejected,
+            "decision": "representation_stability_drop_detected" if rejected else "no_target_specific_stability_drop",
+            "null_gap_mean": float(np.mean(null_gaps)) if null_gaps else None,
+            "null_gap_std": float(np.std(null_gaps)) if null_gaps else None,
+            "null_gap_quantile": epsilon,
+        }
+
+    def verify_ras(self, model_before, model_after, dataset) -> Dict:
+        """
+        Run Representation Augmentation Stability verification.
+
+        Args:
+            model_before: Source model M_s before unlearning.
+            model_after: Unlearned model M_u to verify.
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Verification summary dictionary.
+        """
+        if model_before is None:
+            raise ValueError("RAS requires model_before as the original trained model M_s.")
+        if model_after is None:
+            raise ValueError("RAS requires model_after as the unlearned model M_u.")
+
+        granularity, primary_layers, control_layers = self._resolve_layer_plan()
+        if self.primary_layers is None and granularity == "sample":
+            primary_layers = ["stem", "early"]
+        if self.control_layers is None and granularity == "sample":
+            control_layers = ["late"]
+        all_layers = self._deduplicate_layers(primary_layers + control_layers)
+        forget_set = dataset.get_unlearning_set()
+        retained_probe_set = self._sample_retained_subset(dataset)
+
+        print("[RUV][RAS] ===== Start Representation Augmentation Stability Verification =====")
+        print(
+            f"[RUV][RAS] Setup: granularity={granularity}, stages={all_layers}, "
+            f"views={self.ras_num_views}, crop_padding={self.ras_crop_padding}, "
+            f"hflip_prob={self.ras_hflip_prob}, noise_std={self.ras_noise_std}, "
+            f"D_u={len(forget_set)}, D_r'={len(retained_probe_set)}, "
+            f"permutations={self.num_permutations}"
+        )
+
+        print("[RUV][RAS] Extracting M_s stability scores...")
+        du_before = self.extract_ras_scores(model_before, forget_set, all_layers, seed_offset=1000)
+        dr_before = self.extract_ras_scores(model_before, retained_probe_set, all_layers, seed_offset=2000)
+        print("[RUV][RAS] Extracting M_u stability scores...")
+        du_after = self.extract_ras_scores(model_after, forget_set, all_layers, seed_offset=1000)
+        dr_after = self.extract_ras_scores(model_after, retained_probe_set, all_layers, seed_offset=2000)
+
+        stage_results = {}
+        for layer in all_layers:
+            stage_results[layer] = self._evaluate_ras_drop(
+                target_before=du_before[layer],
+                target_after=du_after[layer],
+                control_before=dr_before[layer],
+                control_after=dr_after[layer],
+            )
+            print(
+                f"[RUV][RAS][Stage:{layer}] "
+                f"drop={stage_results[layer]['ras_drop']['mean']:.6f} "
+                f"control_drop={stage_results[layer]['control_ras_drop']['mean']:.6f} "
+                f"gap={stage_results[layer]['ras_gap']:.6f} "
+                f"p_value={stage_results[layer]['p_value']:.6g} "
+                f"epsilon={stage_results[layer]['epsilon']:.6f}"
+            )
+
+        primary_before = np.mean(np.stack([du_before[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_after = np.mean(np.stack([du_after[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_before = np.mean(np.stack([dr_before[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_after = np.mean(np.stack([dr_after[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_result = self._evaluate_ras_drop(
+            target_before=primary_before,
+            target_after=primary_after,
+            control_before=primary_control_before,
+            control_after=primary_control_after,
+        )
+
+        result = {
+            "status": "ok",
+            "method": "ras",
+            "full_name": "Representation Augmentation Stability",
+            "representation_name": "Model Representation State",
+            "metric": "RAS Stability Drop Gap",
+            "granularity": granularity,
+            "primary_stages": primary_layers,
+            "control_stages": control_layers,
+            "ras_num_views": self.ras_num_views,
+            "ras_crop_padding": self.ras_crop_padding,
+            "ras_hflip_prob": self.ras_hflip_prob,
+            "ras_noise_std": self.ras_noise_std,
+            "ras_gap": primary_result["ras_gap"],
+            "p_value": primary_result["p_value"],
+            "target_drop_p_value": primary_result["target_drop_p_value"],
+            "epsilon": primary_result["epsilon"],
+            "alpha": self.alpha,
+            "rejected": primary_result["rejected"],
+            "decision": primary_result["decision"],
+            "interpretation": (
+                "D_u shows a target-specific representation stability drop under augmentations."
+                if primary_result["rejected"]
+                else "No statistically significant target-specific representation stability drop was detected."
+            ),
+            "ras_before": primary_result["ras_before"],
+            "ras_after": primary_result["ras_after"],
+            "ras_drop": primary_result["ras_drop"],
+            "control_ras_before": primary_result["control_ras_before"],
+            "control_ras_after": primary_result["control_ras_after"],
+            "control_ras_drop": primary_result["control_ras_drop"],
+            "stage_results": stage_results,
+            "num_forget": int(len(primary_before)),
+            "num_retained_probe": int(len(primary_control_before)),
+            "num_permutations": self.num_permutations,
+            "null_gap_mean": primary_result["null_gap_mean"],
+            "null_gap_std": primary_result["null_gap_std"],
+            "null_gap_quantile": primary_result["null_gap_quantile"],
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+        }
+
+        print(
+            f"[RUV][RAS][Primary] drop={result['ras_drop']['mean']:.6f} "
+            f"control_drop={result['control_ras_drop']['mean']:.6f} "
+            f"gap={result['ras_gap']:.6f} p_value={result['p_value']:.6g} "
+            f"epsilon={result['epsilon']:.6f}"
+        )
+        print(f"[RUV][RAS] decision={result['decision']}")
+        print("[RUV][RAS] ===== RAS Finished =====")
+        return result
+
     def verify_rms_knn(self, model_before, model_after, dataset) -> Dict:
         """
         Run RMS-kNN sample-level representation membership verification.
@@ -824,6 +1115,8 @@ class RUVVerifier(BaseVerifier):
             raise ValueError("RUV requires model_before as the original trained model M_s.")
         if model_after is None:
             raise ValueError("RUV requires model_after as the unlearned model M_u.")
+        if self.metric in {"ras", "stability", "augmentation_stability", "aug_stability"}:
+            return self.verify_ras(model_before, model_after, dataset)
         if self.metric in {"rms", "rms_knn", "rms-knn", "membership", "membership_knn"}:
             return self.verify_rms_knn(model_before, model_after, dataset)
 
