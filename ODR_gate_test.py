@@ -92,6 +92,20 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
     return cfg
 
 
+def _ensure_path_ready(path_value: str) -> None:
+    """
+    Create the proper directory for a file-or-directory path.
+
+    Args:
+        path_value: Directory path or checkpoint file path.
+    """
+    path = Path(str(path_value))
+    if path.suffix:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        path.mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
     """Run ODR-Gate exact registry experiment."""
     args = _build_args()
@@ -101,8 +115,8 @@ def main() -> None:
     if config["device"] == "cuda" and not torch.cuda.is_available():
         config["device"] = "cpu"
 
-    Path(config["trained_weights_path"]).mkdir(parents=True, exist_ok=True)
-    Path(config["unlearned_weights_path"]).mkdir(parents=True, exist_ok=True)
+    _ensure_path_ready(config["trained_weights_path"])
+    _ensure_path_ready(config["unlearned_weights_path"])
     set_seed(int(config.get("seed", 42)))
 
     print("[ODR_GATE_TEST] ===== Pipeline Configuration =====")
