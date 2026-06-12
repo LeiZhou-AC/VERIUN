@@ -25,3 +25,19 @@ ruv_ras_hflip_prob: 0.5
 ruv_ras_noise_std: 0.0
 ruv_alpha: 0.05
 ruv_num_permutations: 100
+
+scrub_epochs: 8
+scrub_lr: 0.0001
+scrub_optimizer: adamw
+scrub_momentum: 0.9
+scrub_weight_decay: 0.0
+scrub_temperature: 4.0
+scrub_forget_ce_weight: 1.0
+scrub_forget_weight: 1.0
+scrub_retain_ce_weight: 1.0
+scrub_retain_kd_weight: 1.0
+scrub_max_forget_batches: 0
+scrub_max_retain_batches: 0
+scrub_grad_clip: 5.0
+scrub_validate_every: 1
+scrub_train_scope: full
