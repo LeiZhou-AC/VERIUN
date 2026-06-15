@@ -1,9 +1,9 @@
-"""End-to-end SCRUB approximate-unlearning runner.
+"""End-to-end Amnesiac relabel approximate-unlearning runner.
 
-This script runs a complete SCRUB experiment:
+This script runs a complete Amnesiac experiment:
 1) Build D_u / D_r with the existing manifest mechanism
 2) Load the trained model from save/weights/trained
-3) Run SCRUB teacher-student approximate unlearning
+3) Relabel D_u with deterministic wrong labels and continue training
 4) Save the unlearned checkpoint to save/weights/unlearned
 5) Print metrics for downstream RUV experiments
 """
@@ -15,7 +15,7 @@ from pathlib import Path
 from pprint import pprint
 
 from configs.data.dataset import UnlearningDataset
-from unlearning.scrub import SCRUBUnlearner
+from unlearning.amnesiac import AmnesiacUnlearner
 from utils.config import load_config
 from utils.seed import set_seed
 
@@ -38,14 +38,14 @@ def _parse_forget_classes(raw: str):
 
 def _build_args() -> argparse.Namespace:
     """
-    Parse SCRUB test arguments.
+    Parse Amnesiac test arguments.
 
     Returns:
         Parsed arguments.
     """
-    parser = argparse.ArgumentParser(description="SCRUB end-to-end test")
+    parser = argparse.ArgumentParser(description="Amnesiac relabel end-to-end test")
     parser.add_argument("--config", type=str, default="configs/config.yaml")
-    # Edit these defaults directly for the next SCRUB run.
+    # Edit these defaults directly for the next Amnesiac run.
     parser.add_argument("--dataset", type=str, default="cifar10")
     parser.add_argument("--model-name", type=str, default="resnet18")
     parser.add_argument("--num-classes", type=int, default=10)
@@ -69,27 +69,25 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--unlearned-path", type=str, default="save/weights/unlearned")
     parser.add_argument("--save-name", type=str, default=None)
 
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd"])
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--temperature", type=float, default=4.0)
-    parser.add_argument("--forget-ce-weight", type=float, default=0.0)
-    parser.add_argument("--forget-weight", type=float, default=1.0)
-    parser.add_argument("--retain-ce-weight", type=float, default=0.99)
-    parser.add_argument("--retain-kd-weight", type=float, default=0.001)
-    parser.add_argument("--max-forget-batches", type=int, default=0)
-    parser.add_argument("--max-retain-batches", type=int, default=0)
+    parser.add_argument("--relabel-weight", type=float, default=1.0)
+    parser.add_argument("--retain-weight", type=float, default=0.5)
+    parser.add_argument("--max-relabel-batches", type=int, default=0)
+    parser.add_argument("--max-retain-batches", type=int, default=64)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--train-scope", type=str, default="full", choices=["full", "backbone", "head"])
+    parser.add_argument("--label-seed", type=int, default=42)
     return parser.parse_args()
 
 
 def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
     """
-    Merge YAML config and CLI overrides.
+    Merge YAML config and script/CLI overrides.
 
     Args:
         base_config: Loaded YAML config.
@@ -117,21 +115,19 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "trained_weights_path": args.trained_path,
             "unlearned_weights_path": args.unlearned_path,
             "device": args.device,
-            "scrub_epochs": args.epochs,
-            "scrub_lr": args.lr,
-            "scrub_optimizer": args.optimizer,
-            "scrub_momentum": args.momentum,
-            "scrub_weight_decay": args.weight_decay,
-            "scrub_temperature": args.temperature,
-            "scrub_forget_ce_weight": args.forget_ce_weight,
-            "scrub_forget_weight": args.forget_weight,
-            "scrub_retain_ce_weight": args.retain_ce_weight,
-            "scrub_retain_kd_weight": args.retain_kd_weight,
-            "scrub_max_forget_batches": args.max_forget_batches,
-            "scrub_max_retain_batches": args.max_retain_batches,
-            "scrub_grad_clip": args.grad_clip,
-            "scrub_validate_every": args.validate_every,
-            "scrub_train_scope": args.train_scope,
+            "amnesiac_epochs": args.epochs,
+            "amnesiac_lr": args.lr,
+            "amnesiac_optimizer": args.optimizer,
+            "amnesiac_momentum": args.momentum,
+            "amnesiac_weight_decay": args.weight_decay,
+            "amnesiac_relabel_weight": args.relabel_weight,
+            "amnesiac_retain_weight": args.retain_weight,
+            "amnesiac_max_relabel_batches": args.max_relabel_batches,
+            "amnesiac_max_retain_batches": args.max_retain_batches,
+            "amnesiac_grad_clip": args.grad_clip,
+            "amnesiac_validate_every": args.validate_every,
+            "amnesiac_train_scope": args.train_scope,
+            "amnesiac_label_seed": args.label_seed,
         }
     )
     if args.allow_download:
@@ -139,7 +135,7 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
     if args.forget_count is not None:
         cfg["forget_count"] = args.forget_count
     if args.save_name:
-        cfg["scrub_checkpoint_name"] = args.save_name
+        cfg["amnesiac_checkpoint_name"] = args.save_name
     forget_classes = _parse_forget_classes(args.forget_classes)
     if forget_classes:
         cfg["forget_classes"] = forget_classes
@@ -161,7 +157,7 @@ def _ensure_path_ready(path_value: str) -> None:
 
 
 def main() -> None:
-    """Run SCRUB approximate unlearning from the project root."""
+    """Run Amnesiac relabel approximate unlearning from the project root."""
     args = _build_args()
     base_config = load_config(args.config)
     config = _merge_config(base_config, args)
@@ -180,13 +176,13 @@ def main() -> None:
 
     set_seed(int(config.get("seed", 42)))
 
-    print("[SCRUB_TEST] ===== Pipeline Configuration =====")
+    print("[AMNESIAC_TEST] ===== Pipeline Configuration =====")
     pprint(config)
 
-    print("[SCRUB_TEST] Building dataset and unlearning split (D_u / D_r)...")
+    print("[AMNESIAC_TEST] Building dataset and unlearning split (D_u / D_r)...")
     dataset = UnlearningDataset(config)
     print(
-        "[SCRUB_TEST] Dataset ready: "
+        "[AMNESIAC_TEST] Dataset ready: "
         f"name={dataset.dataset_name}, "
         f"D_all={len(dataset.get_all_set())}, "
         f"D_u={len(dataset.get_unlearning_set())}, "
@@ -194,17 +190,17 @@ def main() -> None:
         f"D_test={len(dataset.get_test_set())}"
     )
 
-    print("[SCRUB_TEST] Running SCRUB via unlearning/scrub.py ...")
-    unlearner = SCRUBUnlearner(config)
+    print("[AMNESIAC_TEST] Running Amnesiac via unlearning/amnesiac.py ...")
+    unlearner = AmnesiacUnlearner(config)
     result = unlearner.unlearn(model=None, dataset=dataset)
 
-    print("[SCRUB_TEST] ===== SCRUB Completed =====")
-    print(f"[SCRUB_TEST] Status: {result.get('status')}")
-    print(f"[SCRUB_TEST] Save path: {result.get('save_path')}")
-    print(f"[SCRUB_TEST] Forget manifest path: {result.get('forget_manifest_path')}")
-    print(f"[SCRUB_TEST] Epoch logs: {len(result.get('history', []))}")
+    print("[AMNESIAC_TEST] ===== Amnesiac Completed =====")
+    print(f"[AMNESIAC_TEST] Status: {result.get('status')}")
+    print(f"[AMNESIAC_TEST] Save path: {result.get('save_path')}")
+    print(f"[AMNESIAC_TEST] Forget manifest path: {result.get('forget_manifest_path')}")
+    print(f"[AMNESIAC_TEST] Epoch logs: {len(result.get('history', []))}")
     if result.get("history"):
-        print(f"[SCRUB_TEST] Final epoch metrics: {result['history'][-1]}")
+        print(f"[AMNESIAC_TEST] Final epoch metrics: {result['history'][-1]}")
 
 
 if __name__ == "__main__":

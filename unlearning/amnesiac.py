@@ -1,9 +1,9 @@
-"""SCRUB-style approximate unlearning baseline.
+"""Amnesiac relabeling baseline for approximate machine unlearning.
 
-This module implements a practical teacher-student approximation of SCRUB:
-the original trained model is kept as a frozen teacher, while a student copy is
-updated to increase loss on D_u, disagree with the teacher on D_u, and remain
-useful on D_r.
+This module implements a practical variant of Amnesiac Machine Learning for
+post-hoc experiments where the original batch-update logs are unavailable. The
+forget set is relabeled with deterministic wrong labels and the trained model is
+continued on relabeled D_u plus a controlled amount of retained data D_r.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW, SGD
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from configs.data.dataset import UnlearningDataset
 from configs.models.resnet import construct_model
@@ -34,10 +34,10 @@ from utils.config import load_config
 
 def _parse_forget_classes(raw: str):
     """
-    Parse forget classes from a CLI string.
+    Parse forget classes from a comma-separated CLI string.
 
     Args:
-        raw: Comma-separated class ids.
+        raw: Text such as "0,3,5".
 
     Returns:
         List of integer class ids.
@@ -50,12 +50,12 @@ def _parse_forget_classes(raw: str):
 
 def _build_args() -> argparse.Namespace:
     """
-    Build SCRUB CLI arguments.
+    Build command-line arguments for Amnesiac relabeling.
 
     Returns:
         Parsed command-line arguments.
     """
-    parser = argparse.ArgumentParser(description="SCRUB approximate unlearning")
+    parser = argparse.ArgumentParser(description="Amnesiac relabel approximate unlearning")
     parser.add_argument("--config", type=str, default="configs/config.yaml")
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=None)
@@ -85,29 +85,27 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--optimizer", type=str, default=None, choices=["adamw", "sgd"])
     parser.add_argument("--momentum", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
-    parser.add_argument("--temperature", type=float, default=None)
-    parser.add_argument("--forget-ce-weight", type=float, default=None)
-    parser.add_argument("--forget-weight", type=float, default=None)
-    parser.add_argument("--retain-ce-weight", type=float, default=None)
-    parser.add_argument("--retain-kd-weight", type=float, default=None)
-    parser.add_argument("--max-forget-batches", type=int, default=None)
+    parser.add_argument("--relabel-weight", type=float, default=None)
+    parser.add_argument("--retain-weight", type=float, default=None)
+    parser.add_argument("--max-relabel-batches", type=int, default=None)
     parser.add_argument("--max-retain-batches", type=int, default=None)
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--validate-every", type=int, default=None)
     parser.add_argument("--train-scope", type=str, default=None, choices=["full", "backbone", "head"])
+    parser.add_argument("--label-seed", type=int, default=None)
     return parser.parse_args()
 
 
 def _merge_config(base_cfg: Dict, args: argparse.Namespace) -> Dict:
     """
-    Merge CLI overrides into a base config.
+    Merge CLI overrides into a base configuration.
 
     Args:
         base_cfg: Config loaded from YAML.
         args: Parsed CLI arguments.
 
     Returns:
-        Runtime config.
+        Runtime configuration.
     """
     cfg = dict(base_cfg or {})
 
@@ -122,7 +120,7 @@ def _merge_config(base_cfg: Dict, args: argparse.Namespace) -> Dict:
     set_from_arg("num_classes", args.num_classes, 10)
     set_from_arg("in_channels", args.in_channels, 3)
     set_from_arg("data_path", args.data_path, "datasets")
-    set_from_arg("batch_size", args.batch_size, 128)
+    set_from_arg("batch_size", args.batch_size, 64)
     set_from_arg("num_workers", args.num_workers, 4)
     set_from_arg("seed", args.seed, 42)
     set_from_arg("device", args.device, "cuda")
@@ -139,31 +137,29 @@ def _merge_config(base_cfg: Dict, args: argparse.Namespace) -> Dict:
     set_from_arg("trained_weights_path", args.trained_path, "save/weights/trained")
     set_from_arg("unlearned_weights_path", args.unlearned_path, "save/weights/unlearned")
     if args.save_name:
-        cfg["scrub_checkpoint_name"] = args.save_name
+        cfg["amnesiac_checkpoint_name"] = args.save_name
     if args.allow_download:
         cfg["allow_download"] = True
 
-    set_from_arg("scrub_epochs", args.epochs)
-    set_from_arg("scrub_lr", args.lr)
-    set_from_arg("scrub_optimizer", args.optimizer)
-    set_from_arg("scrub_momentum", args.momentum)
-    set_from_arg("scrub_weight_decay", args.weight_decay)
-    set_from_arg("scrub_temperature", args.temperature)
-    set_from_arg("scrub_forget_ce_weight", args.forget_ce_weight)
-    set_from_arg("scrub_forget_weight", args.forget_weight)
-    set_from_arg("scrub_retain_ce_weight", args.retain_ce_weight)
-    set_from_arg("scrub_retain_kd_weight", args.retain_kd_weight)
-    set_from_arg("scrub_max_forget_batches", args.max_forget_batches)
-    set_from_arg("scrub_max_retain_batches", args.max_retain_batches)
-    set_from_arg("scrub_grad_clip", args.grad_clip)
-    set_from_arg("scrub_validate_every", args.validate_every)
-    set_from_arg("scrub_train_scope", args.train_scope)
+    set_from_arg("amnesiac_epochs", args.epochs)
+    set_from_arg("amnesiac_lr", args.lr)
+    set_from_arg("amnesiac_optimizer", args.optimizer)
+    set_from_arg("amnesiac_momentum", args.momentum)
+    set_from_arg("amnesiac_weight_decay", args.weight_decay)
+    set_from_arg("amnesiac_relabel_weight", args.relabel_weight)
+    set_from_arg("amnesiac_retain_weight", args.retain_weight)
+    set_from_arg("amnesiac_max_relabel_batches", args.max_relabel_batches)
+    set_from_arg("amnesiac_max_retain_batches", args.max_retain_batches)
+    set_from_arg("amnesiac_grad_clip", args.grad_clip)
+    set_from_arg("amnesiac_validate_every", args.validate_every)
+    set_from_arg("amnesiac_train_scope", args.train_scope)
+    set_from_arg("amnesiac_label_seed", args.label_seed)
     return cfg
 
 
 def set_seed(seed: int) -> None:
     """
-    Set deterministic seeds for SCRUB experiments.
+    Set deterministic seeds for Amnesiac experiments.
 
     Args:
         seed: Seed value.
@@ -178,30 +174,97 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-@dataclass
-class ScrubEpochStats:
-    """Per-epoch SCRUB metrics."""
+class WrongLabelDataset(Dataset):
+    """Dataset wrapper that replaces each forget-set label with a wrong label."""
 
-    forget_ce: float
-    forget_kl: float
+    def __init__(self, base_dataset: Dataset, num_classes: int, seed: int):
+        """
+        Initialize deterministic wrong labels for D_u.
+
+        Args:
+            base_dataset: Original forget subset.
+            num_classes: Number of classes.
+            seed: Seed controlling wrong-label assignment.
+        """
+        self.base_dataset = base_dataset
+        self.num_classes = int(num_classes)
+        if self.num_classes < 2:
+            raise ValueError("Amnesiac relabeling requires at least two classes.")
+
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        self.wrong_labels = []
+        self.true_labels = []
+        for idx in range(len(self.base_dataset)):
+            item = self.base_dataset[idx]
+            label = self._extract_label(item)
+            offset = int(torch.randint(1, self.num_classes, (1,), generator=generator).item())
+            wrong_label = int((label + offset) % self.num_classes)
+            self.true_labels.append(int(label))
+            self.wrong_labels.append(wrong_label)
+
+    def __len__(self) -> int:
+        """
+        Return dataset size.
+
+        Returns:
+            Number of samples.
+        """
+        return len(self.base_dataset)
+
+    def __getitem__(self, index: int):
+        """
+        Return input, wrong label, and original label.
+
+        Args:
+            index: Sample index.
+
+        Returns:
+            Tuple of image, wrong label, original label.
+        """
+        item = self.base_dataset[index]
+        x = item[0]
+        return x, self.wrong_labels[index], self.true_labels[index]
+
+    @staticmethod
+    def _extract_label(item) -> int:
+        """
+        Extract an integer class label from a dataset item.
+
+        Args:
+            item: Dataset item.
+
+        Returns:
+            Integer label.
+        """
+        label = item[1]
+        if torch.is_tensor(label):
+            return int(label.item())
+        return int(label)
+
+
+@dataclass
+class AmnesiacEpochStats:
+    """Per-epoch Amnesiac relabeling metrics."""
+
+    relabel_ce: float
     retain_ce: float
-    retain_kd: float
-    retain_total: float
-    forget_accuracy: float
+    forget_original_accuracy: float
+    forget_wrong_label_accuracy: float
     forget_confidence: float
     retain_accuracy: float
     test_accuracy: float
 
 
-class SCRUBUnlearner(BaseUnlearner):
-    """Teacher-student SCRUB approximate unlearner."""
+class AmnesiacUnlearner(BaseUnlearner):
+    """Approximate unlearner based on deterministic wrong-label updates."""
 
     def __init__(self, config: Dict):
         """
-        Initialize SCRUB from runtime configuration.
+        Initialize Amnesiac relabeling from runtime configuration.
 
         Args:
-            config: Experiment config.
+            config: Experiment configuration.
         """
         super().__init__(config)
         self.device = torch.device(
@@ -210,25 +273,23 @@ class SCRUBUnlearner(BaseUnlearner):
         if self.device.type == "cuda" and not torch.cuda.is_available():
             self.device = torch.device("cpu")
 
-        self.epochs = int(self.config.get("scrub_epochs", self.config.get("epochs", 8)))
-        self.lr = float(self.config.get("scrub_lr", self.config.get("lr", 1e-4)))
-        self.optimizer_name = str(self.config.get("scrub_optimizer", "adamw")).lower()
-        self.momentum = float(self.config.get("scrub_momentum", self.config.get("momentum", 0.9)))
-        self.weight_decay = float(self.config.get("scrub_weight_decay", 0.0))
-        self.temperature = float(self.config.get("scrub_temperature", 4.0))
-        self.forget_ce_weight = float(self.config.get("scrub_forget_ce_weight", 1.0))
-        self.forget_weight = float(self.config.get("scrub_forget_weight", 1.0))
-        self.retain_ce_weight = float(self.config.get("scrub_retain_ce_weight", 1.0))
-        self.retain_kd_weight = float(self.config.get("scrub_retain_kd_weight", 1.0))
-        self.max_forget_batches = int(self.config.get("scrub_max_forget_batches", 0))
-        self.max_retain_batches = int(self.config.get("scrub_max_retain_batches", 0))
-        self.grad_clip = float(self.config.get("scrub_grad_clip", 5.0))
-        self.validate_every = int(self.config.get("scrub_validate_every", 1))
-        self.train_scope = str(self.config.get("scrub_train_scope", "full")).lower()
+        self.epochs = int(self.config.get("amnesiac_epochs", self.config.get("epochs", 10)))
+        self.lr = float(self.config.get("amnesiac_lr", self.config.get("lr", 1e-4)))
+        self.optimizer_name = str(self.config.get("amnesiac_optimizer", "adamw")).lower()
+        self.momentum = float(self.config.get("amnesiac_momentum", self.config.get("momentum", 0.9)))
+        self.weight_decay = float(self.config.get("amnesiac_weight_decay", 5e-4))
+        self.relabel_weight = float(self.config.get("amnesiac_relabel_weight", 1.0))
+        self.retain_weight = float(self.config.get("amnesiac_retain_weight", 0.5))
+        self.max_relabel_batches = int(self.config.get("amnesiac_max_relabel_batches", 0))
+        self.max_retain_batches = int(self.config.get("amnesiac_max_retain_batches", 64))
+        self.grad_clip = float(self.config.get("amnesiac_grad_clip", 5.0))
+        self.validate_every = int(self.config.get("amnesiac_validate_every", 1))
+        self.train_scope = str(self.config.get("amnesiac_train_scope", "full")).lower()
+        self.label_seed = int(self.config.get("amnesiac_label_seed", self.config.get("split_seed", 42)))
 
     def _infer_target_tag(self) -> str:
         """
-        Build a compact unlearning-target tag for checkpoint names.
+        Build a compact target tag for checkpoint names.
 
         Returns:
             Target tag string.
@@ -258,13 +319,13 @@ class SCRUBUnlearner(BaseUnlearner):
 
     def _resolve_latest_checkpoint(self, root: Path) -> Path:
         """
-        Resolve a checkpoint file from a file or directory path.
+        Resolve a checkpoint from a file or directory path.
 
         Args:
             root: Checkpoint file or directory.
 
         Returns:
-            Resolved checkpoint path.
+            Resolved checkpoint file.
         """
         if root.is_file():
             return root
@@ -277,13 +338,13 @@ class SCRUBUnlearner(BaseUnlearner):
 
     def _extract_state_dict(self, state_obj):
         """
-        Extract a cleaned state dict from common checkpoint formats.
+        Extract a clean model state dict from common checkpoint formats.
 
         Args:
-            state_obj: Raw object returned by torch.load.
+            state_obj: Raw object loaded by torch.load.
 
         Returns:
-            Cleaned model state dict.
+            Cleaned state dict.
         """
         if isinstance(state_obj, dict):
             for key in ("state_dict", "model_state_dict", "model"):
@@ -319,14 +380,14 @@ class SCRUBUnlearner(BaseUnlearner):
 
     def _load_original_model(self, model: Optional[nn.Module], dataset: UnlearningDataset) -> nn.Module:
         """
-        Load the original trained model used as SCRUB teacher.
+        Load the original trained model.
 
         Args:
-            model: Optional pre-loaded model.
+            model: Optional pre-loaded original model.
             dataset: Dataset manager.
 
         Returns:
-            Trained model on the target device.
+            Original model on the target device.
         """
         if model is not None:
             return copy.deepcopy(model).to(self.device)
@@ -339,11 +400,11 @@ class SCRUBUnlearner(BaseUnlearner):
         model = self._build_model_from_config(dataset)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         model = model.to(self.device)
-        print(f"[SCRUB] Loaded trained checkpoint: {checkpoint_path}")
+        print(f"[AMNESIAC] Loaded trained checkpoint: {checkpoint_path}")
         if missing:
-            print(f"[SCRUB][Load] Missing keys count: {len(missing)}")
+            print(f"[AMNESIAC][Load] Missing keys count: {len(missing)}")
         if unexpected:
-            print(f"[SCRUB][Load] Unexpected keys count: {len(unexpected)}")
+            print(f"[AMNESIAC][Load] Unexpected keys count: {len(unexpected)}")
         return model
 
     def _set_train_scope(self, model: nn.Module) -> None:
@@ -351,7 +412,7 @@ class SCRUBUnlearner(BaseUnlearner):
         Select which model parameters are trainable.
 
         Args:
-            model: Student model.
+            model: Model to update.
         """
         for param in model.parameters():
             param.requires_grad = self.train_scope == "full"
@@ -362,7 +423,7 @@ class SCRUBUnlearner(BaseUnlearner):
                 if hasattr(model, name):
                     modules.append(getattr(model, name))
             if not modules:
-                raise RuntimeError("scrub_train_scope='head' but no classifier/head module was found.")
+                raise RuntimeError("amnesiac_train_scope='head' but no classifier/head module was found.")
             for module in modules:
                 for param in module.parameters():
                     param.requires_grad = True
@@ -372,52 +433,36 @@ class SCRUBUnlearner(BaseUnlearner):
                 if hasattr(model, name):
                     modules.append(getattr(model, name))
             if not modules:
-                raise RuntimeError("scrub_train_scope='backbone' but no backbone/features module was found.")
+                raise RuntimeError("amnesiac_train_scope='backbone' but no backbone/features module was found.")
             for module in modules:
                 for param in module.parameters():
                     param.requires_grad = True
         elif self.train_scope != "full":
-            raise ValueError(f"Unsupported SCRUB train scope: {self.train_scope}")
+            raise ValueError(f"Unsupported Amnesiac train scope: {self.train_scope}")
 
     def _build_optimizer(self, model: nn.Module):
         """
-        Build optimizer over trainable student parameters.
+        Build an optimizer over trainable parameters.
 
         Args:
-            model: Student model.
+            model: Model to update.
 
         Returns:
             Optimizer instance.
         """
         params = [p for p in model.parameters() if p.requires_grad]
         if not params:
-            raise RuntimeError("No trainable parameters found for SCRUB.")
+            raise RuntimeError("No trainable parameters found for Amnesiac.")
         if self.optimizer_name == "sgd":
             return SGD(params, lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
         return AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
-
-    def _distill_kl(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
-        """
-        Compute temperature-scaled distillation KL.
-
-        Args:
-            student_logits: Student logits.
-            teacher_logits: Frozen teacher logits.
-
-        Returns:
-            KL divergence loss for matching teacher outputs.
-        """
-        temperature = max(self.temperature, 1e-6)
-        student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-        teacher_probs = F.softmax(teacher_logits.detach() / temperature, dim=1)
-        return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
 
     def _maybe_clip_gradients(self, model: nn.Module) -> None:
         """
         Clip gradients when configured.
 
         Args:
-            model: Student model.
+            model: Model with gradients.
         """
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -425,93 +470,98 @@ class SCRUBUnlearner(BaseUnlearner):
                 max_norm=self.grad_clip,
             )
 
-    def _run_forget_epoch(
-        self,
-        student: nn.Module,
-        teacher: nn.Module,
-        loader: DataLoader,
-        optimizer,
-    ) -> Dict[str, float]:
+    def _build_wrong_label_loader(self, dataset: UnlearningDataset) -> DataLoader:
         """
-        Run one SCRUB forget phase on D_u.
+        Build a forget-set dataloader with deterministic wrong labels.
 
         Args:
-            student: Trainable student model.
-            teacher: Frozen original model.
-            loader: Forget-set dataloader.
-            optimizer: Student optimizer.
+            dataset: Dataset manager.
 
         Returns:
-            Forget metrics for the epoch.
+            Dataloader over relabeled D_u.
         """
-        student.train()
-        teacher.eval()
+        wrong_dataset = WrongLabelDataset(
+            dataset.get_unlearning_set(),
+            num_classes=int(self.config.get("num_classes", dataset.num_classes)),
+            seed=self.label_seed,
+        )
+        return DataLoader(
+            wrong_dataset,
+            batch_size=int(self.config.get("batch_size", 64)),
+            shuffle=True,
+            num_workers=int(self.config.get("num_workers", 4)),
+            pin_memory=bool(self.config.get("pin_memory", torch.cuda.is_available())),
+        )
+
+    def _run_relabel_epoch(self, model: nn.Module, loader: DataLoader, optimizer) -> Dict[str, float]:
+        """
+        Run one wrong-label update phase on D_u.
+
+        Args:
+            model: Model to update.
+            loader: Wrong-label D_u dataloader.
+            optimizer: Optimizer.
+
+        Returns:
+            Forget-phase metrics.
+        """
+        model.train()
         total_ce = 0.0
-        total_kl = 0.0
         total_conf = 0.0
-        correct = 0
+        original_correct = 0
+        wrong_correct = 0
         total = 0
         steps = 0
 
-        for batch_idx, (x, y) in enumerate(loader, start=1):
-            if self.max_forget_batches > 0 and batch_idx > self.max_forget_batches:
+        for batch_idx, (x, wrong_y, true_y) in enumerate(loader, start=1):
+            if self.max_relabel_batches > 0 and batch_idx > self.max_relabel_batches:
                 break
 
             x = x.to(self.device)
-            y = y.to(self.device)
-            with torch.no_grad():
-                teacher_logits = teacher(x)
+            wrong_y = wrong_y.to(self.device)
+            true_y = true_y.to(self.device)
 
             optimizer.zero_grad()
-            student_logits = student(x)
-            ce_loss = F.cross_entropy(student_logits, y)
-            kl_loss = self._distill_kl(student_logits, teacher_logits)
-            loss = -(self.forget_ce_weight * ce_loss + self.forget_weight * kl_loss)
+            logits = model(x)
+            ce_loss = F.cross_entropy(logits, wrong_y)
+            loss = self.relabel_weight * ce_loss
             loss.backward()
-            self._maybe_clip_gradients(student)
+            self._maybe_clip_gradients(model)
             optimizer.step()
 
             with torch.no_grad():
-                probs = F.softmax(student_logits, dim=1)
+                probs = F.softmax(logits, dim=1)
+                preds = logits.argmax(dim=1)
+                batch_size = int(true_y.size(0))
+                total_ce += float(ce_loss.item()) * batch_size
                 total_conf += float(probs.max(dim=1).values.sum().item())
-                correct += int((student_logits.argmax(dim=1) == y).sum().item())
-                total += int(y.size(0))
-                total_ce += float(ce_loss.item()) * y.size(0)
-                total_kl += float(kl_loss.item()) * y.size(0)
+                original_correct += int((preds == true_y).sum().item())
+                wrong_correct += int((preds == wrong_y).sum().item())
+                total += batch_size
                 steps += 1
 
         return {
-            "forget_ce": total_ce / max(total, 1),
-            "forget_kl": total_kl / max(total, 1),
-            "forget_accuracy": correct / max(total, 1),
+            "relabel_ce": total_ce / max(total, 1),
+            "forget_original_accuracy": original_correct / max(total, 1),
+            "forget_wrong_label_accuracy": wrong_correct / max(total, 1),
             "forget_confidence": total_conf / max(total, 1),
-            "forget_steps": float(steps),
+            "relabel_steps": float(steps),
         }
 
-    def _run_retain_epoch(
-        self,
-        student: nn.Module,
-        teacher: nn.Module,
-        loader: DataLoader,
-        optimizer,
-    ) -> Dict[str, float]:
+    def _run_retain_epoch(self, model: nn.Module, loader: DataLoader, optimizer) -> Dict[str, float]:
         """
-        Run one SCRUB retain phase on D_r.
+        Run one utility-preservation update phase on D_r.
 
         Args:
-            student: Trainable student model.
-            teacher: Frozen original model.
+            model: Model to update.
             loader: Retained-set dataloader.
-            optimizer: Student optimizer.
+            optimizer: Optimizer.
 
         Returns:
-            Retain metrics for the epoch.
+            Retain-phase metrics.
         """
-        student.train()
-        teacher.eval()
+        model.train()
         total_ce = 0.0
-        total_kd = 0.0
-        total_loss = 0.0
         correct = 0
         total = 0
         steps = 0
@@ -522,41 +572,34 @@ class SCRUBUnlearner(BaseUnlearner):
 
             x = x.to(self.device)
             y = y.to(self.device)
-            with torch.no_grad():
-                teacher_logits = teacher(x)
 
             optimizer.zero_grad()
-            student_logits = student(x)
-            ce_loss = F.cross_entropy(student_logits, y)
-            kd_loss = self._distill_kl(student_logits, teacher_logits)
-            loss = self.retain_ce_weight * ce_loss + self.retain_kd_weight * kd_loss
+            logits = model(x)
+            ce_loss = F.cross_entropy(logits, y)
+            loss = self.retain_weight * ce_loss
             loss.backward()
-            self._maybe_clip_gradients(student)
+            self._maybe_clip_gradients(model)
             optimizer.step()
 
             batch_size = int(y.size(0))
             total_ce += float(ce_loss.item()) * batch_size
-            total_kd += float(kd_loss.item()) * batch_size
-            total_loss += float(loss.item()) * batch_size
-            correct += int((student_logits.argmax(dim=1) == y).sum().item())
+            correct += int((logits.argmax(dim=1) == y).sum().item())
             total += batch_size
             steps += 1
 
         return {
             "retain_ce": total_ce / max(total, 1),
-            "retain_kd": total_kd / max(total, 1),
-            "retain_total": total_loss / max(total, 1),
             "retain_train_accuracy": correct / max(total, 1),
             "retain_steps": float(steps),
         }
 
     def _evaluate_split(self, model: nn.Module, loader: DataLoader, name: str) -> Dict[str, float]:
         """
-        Evaluate accuracy and confidence on a split.
+        Evaluate accuracy and confidence on a standard split.
 
         Args:
             model: Model to evaluate.
-            loader: Split dataloader.
+            loader: Evaluation dataloader.
             name: Split name for logging.
 
         Returns:
@@ -586,72 +629,119 @@ class SCRUBUnlearner(BaseUnlearner):
             "total": total,
         }
         print(
-            f"[SCRUB][Eval] {name}: acc={metrics['accuracy']:.4f} "
+            f"[AMNESIAC][Eval] {name}: acc={metrics['accuracy']:.4f} "
             f"loss={metrics['loss']:.4f} conf={metrics['mean_confidence']:.4f} "
             f"({correct}/{total})"
         )
         return metrics
 
+    def _evaluate_wrong_label_split(self, model: nn.Module, loader: DataLoader) -> Dict[str, float]:
+        """
+        Evaluate D_u against both original and wrong labels.
+
+        Args:
+            model: Model to evaluate.
+            loader: Wrong-label D_u dataloader.
+
+        Returns:
+            Metrics dictionary.
+        """
+        model.eval()
+        total_ce = 0.0
+        total_conf = 0.0
+        original_correct = 0
+        wrong_correct = 0
+        total = 0
+        with torch.no_grad():
+            for x, wrong_y, true_y in loader:
+                x = x.to(self.device)
+                wrong_y = wrong_y.to(self.device)
+                true_y = true_y.to(self.device)
+                logits = model(x)
+                probs = F.softmax(logits, dim=1)
+                preds = logits.argmax(dim=1)
+                batch_size = int(true_y.size(0))
+                total_ce += float(F.cross_entropy(logits, wrong_y).item()) * batch_size
+                total_conf += float(probs.max(dim=1).values.sum().item())
+                original_correct += int((preds == true_y).sum().item())
+                wrong_correct += int((preds == wrong_y).sum().item())
+                total += batch_size
+
+        metrics = {
+            "wrong_label_loss": total_ce / max(total, 1),
+            "original_accuracy": original_correct / max(total, 1),
+            "wrong_label_accuracy": wrong_correct / max(total, 1),
+            "mean_confidence": total_conf / max(total, 1),
+            "original_correct": original_correct,
+            "wrong_correct": wrong_correct,
+            "total": total,
+        }
+        print(
+            "[AMNESIAC][Eval] forget: "
+            f"orig_acc={metrics['original_accuracy']:.4f} "
+            f"wrong_acc={metrics['wrong_label_accuracy']:.4f} "
+            f"wrong_loss={metrics['wrong_label_loss']:.4f} "
+            f"conf={metrics['mean_confidence']:.4f} "
+            f"(orig {original_correct}/{total}, wrong {wrong_correct}/{total})"
+        )
+        return metrics
+
     def unlearn(self, model: Optional[nn.Module], dataset: UnlearningDataset) -> Dict:
         """
-        Execute SCRUB approximate unlearning.
+        Execute Amnesiac relabel approximate unlearning.
 
         Args:
             model: Optional original trained model.
             dataset: Dataset manager exposing D_u, D_r, and D_test.
 
         Returns:
-            Summary dictionary containing the unlearned model and save path.
+            Summary dictionary containing the updated model and save path.
         """
         set_seed(int(self.config.get("seed", 42)))
         loaders = dataset.get_dataloaders(retained_shuffle=True)
-        forget_loader = loaders["d_u"]
+        relabel_loader = self._build_wrong_label_loader(dataset)
         retain_loader = loaders["d_r"]
         test_loader = loaders["d_test"]
 
-        teacher = self._load_original_model(model, dataset)
-        student = copy.deepcopy(teacher).to(self.device)
-        teacher.eval()
-        for param in teacher.parameters():
-            param.requires_grad = False
-
+        student = self._load_original_model(model, dataset)
         self._set_train_scope(student)
         optimizer = self._build_optimizer(student)
         trainable_count = sum(p.numel() for p in student.parameters() if p.requires_grad)
 
-        print("[SCRUB] ===== Start SCRUB Approximate Unlearning =====")
+        print("[AMNESIAC] ===== Start Amnesiac Relabel Unlearning =====")
         print(
-            f"[SCRUB] setup: model={self.config.get('model_name', 'resnet18')}, "
+            f"[AMNESIAC] setup: model={self.config.get('model_name', 'resnet18')}, "
             f"dataset={dataset.dataset_name}, device={self.device}, train_scope={self.train_scope}"
         )
         print(
-            f"[SCRUB] sizes: D_u={len(dataset.get_unlearning_set())}, "
+            f"[AMNESIAC] sizes: D_u={len(dataset.get_unlearning_set())}, "
             f"D_r={len(dataset.get_retained_set())}, D_test={len(dataset.get_test_set())}"
         )
         print(
-            f"[SCRUB] hyper: optimizer={self.optimizer_name}, lr={self.lr}, "
-            f"epochs={self.epochs}, T={self.temperature}, "
-            f"forget_ce_w={self.forget_ce_weight}, forget_kd_w={self.forget_weight}, "
-            f"retain_ce_w={self.retain_ce_weight}, retain_kd_w={self.retain_kd_weight}, "
-            f"weight_decay={self.weight_decay}, grad_clip={self.grad_clip}"
+            f"[AMNESIAC] hyper: optimizer={self.optimizer_name}, lr={self.lr}, "
+            f"epochs={self.epochs}, relabel_w={self.relabel_weight}, retain_w={self.retain_weight}, "
+            f"max_relabel_batches={self.max_relabel_batches}, max_retain_batches={self.max_retain_batches}, "
+            f"weight_decay={self.weight_decay}, grad_clip={self.grad_clip}, label_seed={self.label_seed}"
         )
-        print(f"[SCRUB] trainable parameters: {trainable_count}")
+        print(f"[AMNESIAC] trainable parameters: {trainable_count}")
 
         history = []
         final_eval = {}
         for epoch in range(1, self.epochs + 1):
-            forget_stats = self._run_forget_epoch(student, teacher, forget_loader, optimizer)
-            retain_stats = self._run_retain_epoch(student, teacher, retain_loader, optimizer)
+            relabel_stats = self._run_relabel_epoch(student, relabel_loader, optimizer)
+            retain_stats = self._run_retain_epoch(student, retain_loader, optimizer)
 
-            forget_accuracy = forget_stats["forget_accuracy"]
-            forget_confidence = forget_stats["forget_confidence"]
+            forget_original_accuracy = relabel_stats["forget_original_accuracy"]
+            forget_wrong_label_accuracy = relabel_stats["forget_wrong_label_accuracy"]
+            forget_confidence = relabel_stats["forget_confidence"]
             retain_accuracy = 0.0
             test_accuracy = 0.0
             if epoch % max(self.validate_every, 1) == 0:
-                forget_eval = self._evaluate_split(student, forget_loader, "forget")
+                forget_eval = self._evaluate_wrong_label_split(student, relabel_loader)
                 retain_eval = self._evaluate_split(student, retain_loader, "retain")
                 test_eval = self._evaluate_split(student, test_loader, "test")
-                forget_accuracy = forget_eval["accuracy"]
+                forget_original_accuracy = forget_eval["original_accuracy"]
+                forget_wrong_label_accuracy = forget_eval["wrong_label_accuracy"]
                 forget_confidence = forget_eval["mean_confidence"]
                 retain_accuracy = retain_eval["accuracy"]
                 test_accuracy = test_eval["accuracy"]
@@ -661,44 +751,38 @@ class SCRUBUnlearner(BaseUnlearner):
                     "test": test_eval,
                 }
 
-            stats = ScrubEpochStats(
-                forget_ce=forget_stats["forget_ce"],
-                forget_kl=forget_stats["forget_kl"],
+            stats = AmnesiacEpochStats(
+                relabel_ce=relabel_stats["relabel_ce"],
                 retain_ce=retain_stats["retain_ce"],
-                retain_kd=retain_stats["retain_kd"],
-                retain_total=retain_stats["retain_total"],
-                forget_accuracy=forget_accuracy,
+                forget_original_accuracy=forget_original_accuracy,
+                forget_wrong_label_accuracy=forget_wrong_label_accuracy,
                 forget_confidence=forget_confidence,
                 retain_accuracy=retain_accuracy,
                 test_accuracy=test_accuracy,
             )
-            history.append(
-                {
-                    "epoch": epoch,
-                    "forget_ce": stats.forget_ce,
-                    "forget_kl": stats.forget_kl,
-                    "retain_ce": stats.retain_ce,
-                    "retain_kd": stats.retain_kd,
-                    "retain_total": stats.retain_total,
-                    "forget_accuracy": stats.forget_accuracy,
-                    "forget_confidence": stats.forget_confidence,
-                    "retain_accuracy": stats.retain_accuracy,
-                    "test_accuracy": stats.test_accuracy,
-                    "forget_steps": forget_stats["forget_steps"],
-                    "retain_steps": retain_stats["retain_steps"],
-                }
-            )
+            epoch_record = {
+                "epoch": epoch,
+                "relabel_ce": stats.relabel_ce,
+                "retain_ce": stats.retain_ce,
+                "forget_original_accuracy": stats.forget_original_accuracy,
+                "forget_wrong_label_accuracy": stats.forget_wrong_label_accuracy,
+                "forget_confidence": stats.forget_confidence,
+                "retain_accuracy": stats.retain_accuracy,
+                "test_accuracy": stats.test_accuracy,
+                "relabel_steps": relabel_stats["relabel_steps"],
+                "retain_steps": retain_stats["retain_steps"],
+            }
+            history.append(epoch_record)
             print(
-                f"[SCRUB][Epoch {epoch:03d}/{self.epochs:03d}] "
-                f"forget_ce={stats.forget_ce:.6f} "
-                f"forget_kl={stats.forget_kl:.6f} "
+                f"[AMNESIAC][Epoch {epoch:03d}/{self.epochs:03d}] "
+                f"relabel_ce={stats.relabel_ce:.6f} "
                 f"retain_ce={stats.retain_ce:.6f} "
-                f"retain_kd={stats.retain_kd:.6f} "
-                f"retain_total={stats.retain_total:.6f} "
-                f"forget_acc={stats.forget_accuracy:.4f} "
+                f"forget_orig_acc={stats.forget_original_accuracy:.4f} "
+                f"forget_wrong_acc={stats.forget_wrong_label_accuracy:.4f} "
                 f"forget_conf={stats.forget_confidence:.4f} "
                 f"retain_acc={stats.retain_accuracy:.4f} "
-                f"test_acc={stats.test_accuracy:.4f}"
+                f"test_acc={stats.test_accuracy:.4f} "
+                f"steps=({int(relabel_stats['relabel_steps'])}/{int(retain_stats['retain_steps'])})"
             )
 
         save_dir = Path(str(self.config.get("unlearned_weights_path", "save/weights/unlearned")))
@@ -706,13 +790,13 @@ class SCRUBUnlearner(BaseUnlearner):
         model_name = str(self.config.get("model_name", "resnet18"))
         target_tag = self._infer_target_tag()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"scrub_{model_name}_{dataset.dataset_name}_{target_tag}_{timestamp}.pt"
-        checkpoint_name = str(self.config.get("scrub_checkpoint_name", default_name))
+        default_name = f"amnesiac_{model_name}_{dataset.dataset_name}_{target_tag}_{timestamp}.pt"
+        checkpoint_name = str(self.config.get("amnesiac_checkpoint_name", default_name))
         save_path = save_dir / checkpoint_name
         torch.save(
             {
                 "state_dict": student.state_dict(),
-                "method": "scrub",
+                "method": "amnesiac_relabel",
                 "model_name": model_name,
                 "dataset": dataset.dataset_name,
                 "num_classes": int(self.config.get("num_classes", dataset.num_classes)),
@@ -727,27 +811,27 @@ class SCRUBUnlearner(BaseUnlearner):
                 "forget_manifest": (
                     dataset.get_forget_manifest_info() if hasattr(dataset, "get_forget_manifest_info") else None
                 ),
-                "scrub_config": {
+                "amnesiac_config": {
                     "epochs": self.epochs,
                     "lr": self.lr,
                     "optimizer": self.optimizer_name,
-                    "temperature": self.temperature,
-                    "forget_ce_weight": self.forget_ce_weight,
-                    "forget_weight": self.forget_weight,
-                    "retain_ce_weight": self.retain_ce_weight,
-                    "retain_kd_weight": self.retain_kd_weight,
+                    "relabel_weight": self.relabel_weight,
+                    "retain_weight": self.retain_weight,
+                    "max_relabel_batches": self.max_relabel_batches,
+                    "max_retain_batches": self.max_retain_batches,
                     "train_scope": self.train_scope,
+                    "label_seed": self.label_seed,
                 },
                 "seed": int(self.config.get("seed", 42)),
             },
             str(save_path),
         )
-        print(f"[SCRUB] Saved unlearned model to: {save_path}")
-        print("[SCRUB] ===== SCRUB Unlearning Finished =====")
+        print(f"[AMNESIAC] Saved unlearned model to: {save_path}")
+        print("[AMNESIAC] ===== Amnesiac Unlearning Finished =====")
 
         return {
             "status": "ok",
-            "method": "scrub",
+            "method": "amnesiac_relabel",
             "model": student,
             "save_path": str(save_path),
             "history": history,
@@ -762,12 +846,12 @@ class SCRUBUnlearner(BaseUnlearner):
 
 
 def main() -> None:
-    """Standalone CLI entry for SCRUB approximate unlearning."""
+    """Standalone CLI entry for Amnesiac relabel approximate unlearning."""
     args = _build_args()
     base_cfg = load_config(args.config)
     cfg = _merge_config(base_cfg, args)
     dataset = UnlearningDataset(cfg)
-    unlearner = SCRUBUnlearner(cfg)
+    unlearner = AmnesiacUnlearner(cfg)
     unlearner.unlearn(model=None, dataset=dataset)
 
 

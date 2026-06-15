@@ -68,17 +68,18 @@ Class-conditioned sample split:
 python ODR_test.py --dataset cifar10 --model-name resnet18 --split-mode class_random --forget-classes 0 --forget-ratio 0.1 --forget-manifest-mode save
 ```
 
-## SCRUB Test
+## Amnesiac Test
 
-SCRUB is an approximate target-unlearning baseline. It keeps the original model
-as a frozen teacher, initializes a student from the same checkpoint, maximizes
-forget-set loss and teacher-student disagreement on `D_u`, and preserves utility
-on `D_r` with cross-entropy plus distillation.
+Amnesiac is the approximate target-unlearning baseline used in the current
+project. The implemented variant is post-hoc friendly: it loads the trained
+checkpoint, relabels `D_u` with deterministic wrong labels, continues training
+on relabeled `D_u`, and uses a controlled number of `D_r` batches to preserve
+utility.
 
 Random sample-level split using an existing manifest:
 
 ```bash
-python SCRUB_test.py \
+python AMNESIAC_test.py \
   --dataset cifar10 \
   --model-name resnet18 \
   --split-mode random \
@@ -90,18 +91,31 @@ python SCRUB_test.py \
 Class-level split:
 
 ```bash
-python SCRUB_test.py \
+python AMNESIAC_test.py \
   --dataset cifar10 \
   --model-name resnet18 \
   --split-mode by_class \
   --forget-classes 0
 ```
 
-After SCRUB finishes, pass the saved checkpoint to RUV:
+Class-conditioned sample-level split:
+
+```bash
+python AMNESIAC_test.py \
+  --dataset cifar10 \
+  --model-name resnet18 \
+  --split-mode class_random \
+  --forget-classes 0 \
+  --forget-ratio 0.1 \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/cifar10_class0_ratio0p1.json
+```
+
+After Amnesiac finishes, pass the saved checkpoint to RUV:
 
 ```bash
 python RUV_test.py \
-  --unlearned-path save/weights/unlearned/<scrub_checkpoint>.pt \
+  --unlearned-model-path save/weights/unlearned/<amnesiac_checkpoint>.pt \
   --forget-manifest-mode load \
   --forget-manifest-path save/manifests/default_forget_manifest.json
 ```

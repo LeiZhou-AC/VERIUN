@@ -3,7 +3,7 @@
 from unlearning.od import ODRUnlearner
 from unlearning.odr_gate import ODRGateUnlearner
 from unlearning.retrain import RetrainUnlearner
-from unlearning.scrub import SCRUBUnlearner
+from unlearning.amnesiac import AmnesiacUnlearner
 
 
 def get_unlearner(name: str, config):
@@ -14,7 +14,7 @@ def get_unlearner(name: str, config):
     - odr
     - odr_gate
     - retrain
-    - scrub
+    - amnesiac
     - finetune (reserved)
 
     Args:
@@ -35,8 +35,8 @@ def get_unlearner(name: str, config):
         return ODRGateUnlearner(config)
     if normalized_name == "retrain":
         return RetrainUnlearner(config)
-    if normalized_name == "scrub":
-        return SCRUBUnlearner(config)
+    if normalized_name in {"amnesiac", "amnesiac_relabel", "amnesiac-relabel"}:
+        return AmnesiacUnlearner(config)
     if normalized_name == "finetune":
         # TODO: Add a FinetuneUnlearner implementation.
         raise NotImplementedError("Finetune unlearner is reserved for future work.")
