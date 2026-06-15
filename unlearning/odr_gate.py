@@ -356,9 +356,24 @@ class ODRGateUnlearner(BaseUnlearner):
         save_dir.mkdir(parents=True, exist_ok=True)
         model_name = str(self.config.get("model_name", "resnet18"))
         dataset_name = str(getattr(dataset, "dataset_name", self.config.get("dataset", "dataset")))
-        ratio = str(float(self.config.get("forget_ratio", 0.0))).replace(".", "p")
+        split_mode = str(self.config.get("split_mode", "random")).lower()
+        classes = self.config.get("forget_classes", [])
+        if isinstance(classes, (int, float, str)):
+            classes = [classes]
+        class_tag = "-".join(str(int(c)) for c in classes) if classes else "unspecified"
+        if split_mode == "by_class":
+            target_tag = f"byclass_{class_tag}"
+        elif split_mode == "class_random":
+            if self.config.get("forget_count") is not None:
+                target_tag = f"classrandom_{class_tag}_count{int(self.config.get('forget_count'))}"
+            else:
+                ratio = str(float(self.config.get("forget_ratio", 0.0))).replace(".", "p")
+                target_tag = f"classrandom_{class_tag}_ratio{ratio}"
+        else:
+            ratio = str(float(self.config.get("forget_ratio", 0.0))).replace(".", "p")
+            target_tag = f"random_ratio{ratio}"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"odr_gate_exact_{model_name}_{dataset_name}_random_ratio{ratio}_{ts}.pt"
+        default_name = f"odr_gate_exact_{model_name}_{dataset_name}_{target_tag}_{ts}.pt"
         save_path = save_dir / str(self.config.get("odr_gate_checkpoint_name", default_name))
 
         torch.save(

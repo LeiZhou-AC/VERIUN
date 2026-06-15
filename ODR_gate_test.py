@@ -19,6 +19,22 @@ from utils.config import load_config
 from utils.seed import set_seed
 
 
+def _parse_forget_classes(raw: str):
+    """
+    Parse forget class ids from CLI string.
+
+    Args:
+        raw: Comma-separated class ids.
+
+    Returns:
+        List of integer class ids.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    return [int(x.strip()) for x in text.split(",") if x.strip()]
+
+
 def _build_args() -> argparse.Namespace:
     """
     Parse ODR-Gate CLI arguments.
@@ -39,9 +55,10 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--split-mode", type=str, default="random", choices=["random", "by_class"])
+    parser.add_argument("--split-mode", type=str, default="random", choices=["random", "by_class", "class_random"])
     parser.add_argument("--forget-ratio", type=float, default=0.01)
     parser.add_argument("--forget-count", type=int, default=None)
+    parser.add_argument("--forget-classes", type=str, default="")
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--forget-manifest-path", type=str, default="save/manifests/default_forget_manifest.json")
     parser.add_argument("--forget-manifest-mode", type=str, default="load", choices=["auto", "load", "save", "off"])
@@ -87,6 +104,9 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
     )
     if args.forget_count is not None:
         cfg["forget_count"] = args.forget_count
+    forget_classes = _parse_forget_classes(args.forget_classes)
+    if forget_classes:
+        cfg["forget_classes"] = forget_classes
     if args.save_name.strip():
         cfg["odr_gate_checkpoint_name"] = args.save_name.strip()
     return cfg

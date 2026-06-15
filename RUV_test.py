@@ -82,7 +82,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--split-mode", type=str, default="random", choices=["random", "by_class"])
+    parser.add_argument("--split-mode", type=str, default="random", choices=["random", "by_class", "class_random"])
     parser.add_argument("--forget-ratio", type=float, default=0.01)
     parser.add_argument("--forget-count", type=int, default=None)
     parser.add_argument("--forget-classes", type=str, default="")
@@ -259,11 +259,19 @@ def _target_tag(config: dict) -> str:
     Returns:
         Target tag.
     """
-    if str(config.get("split_mode", "random")).lower() == "by_class":
+    split_mode = str(config.get("split_mode", "random")).lower()
+    if split_mode in {"by_class", "class_random"}:
         classes = config.get("forget_classes", [])
         if isinstance(classes, (int, float, str)):
             classes = [classes]
-        return "byclass_" + "-".join(str(int(c)) for c in classes)
+        prefix = "byclass" if split_mode == "by_class" else "classrandom"
+        class_tag = "-".join(str(int(c)) for c in classes)
+        if split_mode == "class_random":
+            if config.get("forget_count") is not None:
+                return f"{prefix}_{class_tag}_count{int(config['forget_count'])}"
+            ratio = str(float(config.get("forget_ratio", 0.1))).replace(".", "p")
+            return f"{prefix}_{class_tag}_ratio{ratio}"
+        return f"{prefix}_{class_tag}"
     if config.get("forget_count") is not None:
         return f"random_count{int(config['forget_count'])}"
     ratio = str(float(config.get("forget_ratio", 0.1))).replace(".", "p")

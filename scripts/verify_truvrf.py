@@ -51,7 +51,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--split-mode", type=str, default="by_class", choices=["random", "by_class"])
+    parser.add_argument("--split-mode", type=str, default="by_class", choices=["random", "by_class", "class_random"])
     parser.add_argument("--forget-classes", type=str, default="")
     parser.add_argument("--forget-manifest-path", type=str, default=None)
     parser.add_argument("--forget-manifest-mode", type=str, default=None)

@@ -64,8 +64,8 @@ class UnlearningDataset:
         - dataset: str, one of mnist/svhn/cifar10/cifar100/stl10
         - data_path: str
         - allow_download: bool, whether to download when local data is missing
-        - split_mode: str, `random` or `by_class`
-        - forget_classes: list[int], used when split_mode is `by_class`
+        - split_mode: str, `random`, `by_class`, or `class_random`
+        - forget_classes: list[int], used when split_mode is `by_class` or `class_random`
         - forget_manifest_path: str, path to persisted D_u/D_r indices
         - forget_manifest_mode: str, one of `auto`, `load`, `save`, `off`
         - batch_size: int
@@ -73,8 +73,8 @@ class UnlearningDataset:
         - pin_memory: bool
         - augmentations: bool
         - normalize: bool
-        - forget_ratio: float in [0, 1]
-        - forget_count: int
+        - forget_ratio: float in [0, 1], global for `random`, per class for `class_random`
+        - forget_count: int, global for `random`, per class for `class_random`
         - split_seed: int
         """
         self.config = config or {}
@@ -86,10 +86,11 @@ class UnlearningDataset:
         self.pin_memory = bool(self.config.get("pin_memory", False))
         self.augmentations = bool(self.config.get("augmentations", True))
         self.normalize = bool(self.config.get("normalize", True))
-        self.split_mode = str(self.config.get("split_mode", "random")).lower()
+        self.split_mode = self._normalize_split_mode(self.config.get("split_mode", "random"))
         self.forget_classes = self._normalize_forget_classes(self.config.get("forget_classes", []))
         self.forget_ratio = self.config.get("forget_ratio", 0.1)
         self.forget_count = self.config.get("forget_count", None)
+        self.forget_count_per_class = self.config.get("forget_count_per_class", None)
         self.split_seed = int(self.config.get("split_seed", 42))
         self.forget_manifest_mode = str(self.config.get("forget_manifest_mode", "auto")).lower()
         self.forget_manifest_path = self._resolve_manifest_path(self.config.get("forget_manifest_path", None))
@@ -111,9 +112,41 @@ class UnlearningDataset:
         self.d_r = Subset(self.d_all, self._dr_indices)
         print(
             f"[Dataset] split_mode={self.split_mode}, "
-            f"forget_classes={self.forget_classes if self.split_mode == 'by_class' else 'N/A'}, "
+            f"forget_classes={self.forget_classes if self.split_mode in {'by_class', 'class_random'} else 'N/A'}, "
             f"D_u={len(self.d_u)}, D_r={len(self.d_r)}"
         )
+
+    def _normalize_split_mode(self, split_mode) -> str:
+        """
+        Normalize split-mode aliases into canonical names.
+
+        Args:
+            split_mode: Raw split mode from config.
+
+        Returns:
+            Canonical split mode.
+        """
+        text = str(split_mode or "random").lower()
+        aliases = {
+            "random": "random",
+            "arbitrary_random": "random",
+            "by_class": "by_class",
+            "class": "by_class",
+            "class_level": "by_class",
+            "class_random": "class_random",
+            "by_class_random": "class_random",
+            "class_sample": "class_random",
+            "class_conditioned": "class_random",
+            "class_conditioned_random": "class_random",
+            "multi_class_random": "class_random",
+            "multi_class_conditioned": "class_random",
+        }
+        if text not in aliases:
+            raise ValueError(
+                "Unsupported split_mode: "
+                f"{split_mode}. Expected one of random, by_class, class_random."
+            )
+        return aliases[text]
 
     def _resolve_manifest_path(self, path_value) -> Path:
         """
@@ -151,6 +184,9 @@ class UnlearningDataset:
             "split_seed": int(self.split_seed),
             "forget_ratio": None if self.forget_count is not None else float(self.forget_ratio),
             "forget_count": None if self.forget_count is None else int(self.forget_count),
+            "forget_count_per_class": (
+                None if self.forget_count_per_class is None else int(self.forget_count_per_class)
+            ),
             "forget_classes": [int(x) for x in self.forget_classes],
             "du_indices": [int(x) for x in du_indices],
             "dr_indices": [int(x) for x in dr_indices],
@@ -199,6 +235,10 @@ class UnlearningDataset:
             raise ValueError(
                 f"Manifest dataset mismatch: expected {self.dataset_name}, got {payload.get('dataset')}"
             )
+        if payload.get("split_mode") != self.split_mode:
+            raise ValueError(
+                f"Manifest split_mode mismatch: expected {self.split_mode}, got {payload.get('split_mode')}"
+            )
         if int(payload.get("total_size", -1)) != int(total_size):
             raise ValueError(
                 f"Manifest total_size mismatch: expected {total_size}, got {payload.get('total_size')}"
@@ -215,6 +255,16 @@ class UnlearningDataset:
                 "Manifest index count mismatch: len(D_u)+len(D_r) must equal len(D_all)."
             )
         return du_indices, dr_indices
+
+    def _validate_forget_classes(self) -> None:
+        """
+        Validate that class-conditioned modes have target classes.
+        """
+        if not self.forget_classes:
+            raise ValueError(
+                f"split_mode='{self.split_mode}' requires non-empty forget_classes, "
+                "for example forget_classes: [0] or forget_classes: [0, 3, 5]."
+            )
 
     def _normalize_forget_classes(self, forget_classes) -> Sequence[int]:
         """
@@ -249,6 +299,109 @@ class UnlearningDataset:
             return int(target.item())
         return int(target)
 
+    def _make_by_class_split(self, dataset: Dataset, total_size: int) -> Tuple[Sequence[int], Sequence[int]]:
+        """
+        Create a class-level split by forgetting all samples from target classes.
+
+        Args:
+            dataset: Full train dataset.
+            total_size: Total dataset size.
+
+        Returns:
+            Tuple of (D_u indices, D_r indices).
+        """
+        self._validate_forget_classes()
+
+        du_indices = []
+        dr_indices = []
+        for idx in range(total_size):
+            label = self._extract_label(dataset, idx)
+            if label in self.forget_classes:
+                du_indices.append(idx)
+            else:
+                dr_indices.append(idx)
+
+        if len(du_indices) == 0:
+            raise ValueError(
+                f"No samples found for forget_classes={self.forget_classes}. "
+                "Please check dataset labels."
+            )
+        if len(dr_indices) == 0:
+            raise ValueError(
+                "All samples were assigned to D_u and D_r became empty. "
+                "Please reduce forget_classes."
+            )
+        return du_indices, dr_indices
+
+    def _class_random_count(self, class_size: int) -> int:
+        """
+        Resolve per-class forget count for class-conditioned sample splits.
+
+        Args:
+            class_size: Number of samples in one selected class.
+
+        Returns:
+            Number of samples to forget from this class.
+        """
+        if self.forget_count_per_class is not None:
+            count = int(self.forget_count_per_class)
+        elif self.forget_count is not None:
+            count = int(self.forget_count)
+        else:
+            count = int(float(self.forget_ratio) * class_size)
+        return max(1, min(count, class_size))
+
+    def _make_class_random_split(self, dataset: Dataset, total_size: int) -> Tuple[Sequence[int], Sequence[int]]:
+        """
+        Create a class-conditioned sample-level split.
+
+        Samples are randomly selected from each class listed in `forget_classes`.
+        For multiple classes, `forget_ratio` and `forget_count` are applied per
+        class, matching multi-class conditioned sample-level unlearning.
+
+        Args:
+            dataset: Full train dataset.
+            total_size: Total dataset size.
+
+        Returns:
+            Tuple of (D_u indices, D_r indices).
+        """
+        self._validate_forget_classes()
+
+        indices_by_class = {int(cls): [] for cls in self.forget_classes}
+        for idx in range(total_size):
+            label = self._extract_label(dataset, idx)
+            if label in indices_by_class:
+                indices_by_class[label].append(idx)
+
+        generator = torch.Generator()
+        generator.manual_seed(self.split_seed)
+
+        du_indices = []
+        class_counts = {}
+        for cls in self.forget_classes:
+            class_indices = indices_by_class[int(cls)]
+            if not class_indices:
+                raise ValueError(
+                    f"No samples found for forget class {cls}. Please check dataset labels."
+                )
+            count = self._class_random_count(len(class_indices))
+            perm = torch.randperm(len(class_indices), generator=generator).tolist()
+            selected = [class_indices[i] for i in perm[:count]]
+            du_indices.extend(selected)
+            class_counts[int(cls)] = int(len(selected))
+
+        du_set = set(int(idx) for idx in du_indices)
+        dr_indices = [idx for idx in range(total_size) if idx not in du_set]
+        if not du_indices or not dr_indices:
+            raise ValueError(
+                "Invalid class_random split: D_u or D_r is empty. "
+                "Please reduce forget_ratio / forget_count."
+            )
+
+        self._class_random_counts = class_counts
+        return du_indices, dr_indices
+
     def _make_unlearning_split(self, dataset: Dataset) -> Tuple[Sequence[int], Sequence[int]]:
         """
         Create deterministic D_u and D_r index splits.
@@ -263,7 +416,8 @@ class UnlearningDataset:
         if total_size <= 0:
             return [], []
 
-        if self.split_mode == "random" and self.forget_manifest_mode in {"auto", "load"}:
+        randomized_modes = {"random", "class_random"}
+        if self.split_mode in randomized_modes and self.forget_manifest_mode in {"auto", "load"}:
             if self.forget_manifest_path.exists():
                 payload = self._load_manifest()
                 return self._validate_manifest(payload, total_size)
@@ -273,33 +427,18 @@ class UnlearningDataset:
                 )
 
         if self.split_mode == "by_class":
-            if not self.forget_classes:
-                raise ValueError(
-                    "split_mode='by_class' requires non-empty forget_classes, "
-                    "for example forget_classes: [0, 1]."
-                )
-
-            du_indices = []
-            dr_indices = []
-            for idx in range(total_size):
-                label = self._extract_label(dataset, idx)
-                if label in self.forget_classes:
-                    du_indices.append(idx)
-                else:
-                    dr_indices.append(idx)
-
-            if len(du_indices) == 0:
-                raise ValueError(
-                    f"No samples found for forget_classes={self.forget_classes}. "
-                    "Please check dataset labels."
-                )
-            if len(dr_indices) == 0:
-                raise ValueError(
-                    "All samples were assigned to D_u and D_r became empty. "
-                    "Please reduce forget_classes."
-                )
-
+            du_indices, dr_indices = self._make_by_class_split(dataset, total_size)
             payload = self._build_manifest_payload(du_indices, dr_indices, total_size)
+            if self.forget_manifest_mode in {"auto", "save"}:
+                self._save_manifest(payload)
+            else:
+                self._forget_manifest_info = payload
+            return du_indices, dr_indices
+
+        if self.split_mode == "class_random":
+            du_indices, dr_indices = self._make_class_random_split(dataset, total_size)
+            payload = self._build_manifest_payload(du_indices, dr_indices, total_size)
+            payload["class_random_counts"] = getattr(self, "_class_random_counts", {})
             if self.forget_manifest_mode in {"auto", "save"}:
                 self._save_manifest(payload)
             else:
@@ -320,7 +459,7 @@ class UnlearningDataset:
         du_indices = perm[:du_size]
         dr_indices = perm[du_size:]
         payload = self._build_manifest_payload(du_indices, dr_indices, total_size)
-        if self.split_mode == "random" and self.forget_manifest_mode in {"auto", "save"}:
+        if self.split_mode in randomized_modes and self.forget_manifest_mode in {"auto", "save"}:
             self._save_manifest(payload)
         else:
             self._forget_manifest_info = payload

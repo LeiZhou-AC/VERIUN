@@ -68,7 +68,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
 
-    parser.add_argument("--split-mode", type=str, default=None, choices=["random", "by_class"])
+    parser.add_argument("--split-mode", type=str, default=None, choices=["random", "by_class", "class_random"])
     parser.add_argument("--forget-ratio", type=float, default=None)
     parser.add_argument("--forget-count", type=int, default=None)
     parser.add_argument("--forget-classes", type=str, default="")
@@ -234,14 +234,21 @@ class SCRUBUnlearner(BaseUnlearner):
             Target tag string.
         """
         split_mode = str(self.config.get("split_mode", "random")).lower()
-        if split_mode == "by_class":
+        if split_mode in {"by_class", "class_random"}:
             classes = self.config.get("forget_classes", [])
             if isinstance(classes, (int, float, str)):
                 classes = [classes]
             classes = [str(int(c)) for c in classes]
             if classes:
-                return "byclass_" + "-".join(classes)
-            return "byclass_unspecified"
+                prefix = "byclass" if split_mode == "by_class" else "classrandom"
+                suffix = "-".join(classes)
+                if split_mode == "class_random":
+                    if self.config.get("forget_count") is not None:
+                        return f"{prefix}_{suffix}_count{int(self.config.get('forget_count'))}"
+                    ratio = str(float(self.config.get("forget_ratio", 0.01))).replace(".", "p")
+                    return f"{prefix}_{suffix}_ratio{ratio}"
+                return f"{prefix}_{suffix}"
+            return f"{split_mode}_unspecified"
 
         if self.config.get("forget_count") is not None:
             return f"random_count{int(self.config.get('forget_count'))}"

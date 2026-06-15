@@ -68,7 +68,7 @@ def _build_args() -> argparse.Namespace:
         "--split-mode",
         type=str,
         default="random",
-        choices=["random", "by_class"],
+        choices=["random", "by_class", "class_random"],
         help="Unlearning split mode.",
     )
     parser.add_argument("--forget-ratio", type=float, default=0.1)
@@ -200,14 +200,21 @@ class RetrainUnlearner(BaseUnlearner):
             Target tag string for checkpoint naming.
         """
         split_mode = str(self.config.get("split_mode", "random")).lower()
-        if split_mode == "by_class":
+        if split_mode in {"by_class", "class_random"}:
             classes = self.config.get("forget_classes", [])
             if isinstance(classes, (int, float, str)):
                 classes = [classes]
             classes = [str(int(c)) for c in classes]
             if classes:
-                return "byclass_" + "-".join(classes)
-            return "byclass_unspecified"
+                prefix = "byclass" if split_mode == "by_class" else "classrandom"
+                suffix = "-".join(classes)
+                if split_mode == "class_random":
+                    if self.config.get("forget_count") is not None:
+                        return f"{prefix}_{suffix}_count{int(self.config.get('forget_count'))}"
+                    ratio = str(float(self.config.get("forget_ratio", 0.1))).replace(".", "p")
+                    return f"{prefix}_{suffix}_ratio{ratio}"
+                return f"{prefix}_{suffix}"
+            return f"{split_mode}_unspecified"
 
         if self.config.get("forget_count") is not None:
             return f"random_count{int(self.config.get('forget_count'))}"

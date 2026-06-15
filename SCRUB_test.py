@@ -57,7 +57,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--split-mode", type=str, default="random", choices=["random", "by_class"])
+    parser.add_argument("--split-mode", type=str, default="random", choices=["random", "by_class", "class_random"])
     parser.add_argument("--forget-ratio", type=float, default=0.01)
     parser.add_argument("--forget-count", type=int, default=None)
     parser.add_argument("--forget-classes", type=str, default="")

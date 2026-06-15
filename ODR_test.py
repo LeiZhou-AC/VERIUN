@@ -53,7 +53,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--in-channels", type=int, default=3, help="Input channel number")
     parser.add_argument("--forget-ratio", type=float, default=0.01, help="Fraction of data to forget")
     parser.add_argument("--forget-count", type=int, default=None, help="Absolute forget sample count")
-    parser.add_argument("--split-mode", type=str, default="by_class", choices=["random", "by_class"], help="How to split D_u and D_r")
+    parser.add_argument("--split-mode", type=str, default="by_class", choices=["random", "by_class", "class_random"], help="How to split D_u and D_r")
     parser.add_argument("--forget-classes", type=str, default="0", help="Comma-separated class ids for by_class mode, e.g. '3,5'")
     parser.add_argument("--forget-manifest-path", type=str, default="save/manifests/default_forget_manifest.json", help="Path to persisted random forget-set manifest")
     parser.add_argument("--forget-manifest-mode", type=str, default="auto", choices=["auto", "load", "save", "off"], help="How to use the forget manifest for random splits")

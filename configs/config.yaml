@@ -1,8 +1,9 @@
 # dataset: cifar10
 # data_path: datasets
 # allow_download: True
-# split_mode: random
+# split_mode: random            # random / by_class / class_random
 # forget_classes: []
+# class_random uses forget_classes and samples forget_ratio/forget_count per class.
 # forget_manifest_path: save/manifests/default_forget_manifest.json
 # forget_manifest_mode: auto
 
