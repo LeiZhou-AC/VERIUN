@@ -82,6 +82,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--train-scope", type=str, default="full", choices=["full", "backbone", "head"])
     parser.add_argument("--label-seed", type=int, default=42)
+    parser.add_argument("--label-strategy", type=str, default="cyclic", choices=["cyclic", "permutation", "random"])
     return parser.parse_args()
 
 
@@ -128,6 +129,7 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "amnesiac_validate_every": args.validate_every,
             "amnesiac_train_scope": args.train_scope,
             "amnesiac_label_seed": args.label_seed,
+            "amnesiac_label_strategy": args.label_strategy,
         }
     )
     if args.allow_download:

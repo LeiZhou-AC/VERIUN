@@ -93,6 +93,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=None)
     parser.add_argument("--train-scope", type=str, default=None, choices=["full", "backbone", "head"])
     parser.add_argument("--label-seed", type=int, default=None)
+    parser.add_argument("--label-strategy", type=str, default=None, choices=["cyclic", "permutation", "random"])
     return parser.parse_args()
 
 
@@ -154,6 +155,7 @@ def _merge_config(base_cfg: Dict, args: argparse.Namespace) -> Dict:
     set_from_arg("amnesiac_validate_every", args.validate_every)
     set_from_arg("amnesiac_train_scope", args.train_scope)
     set_from_arg("amnesiac_label_seed", args.label_seed)
+    set_from_arg("amnesiac_label_strategy", args.label_strategy)
     return cfg
 
 
@@ -177,7 +179,7 @@ def set_seed(seed: int) -> None:
 class WrongLabelDataset(Dataset):
     """Dataset wrapper that replaces each forget-set label with a wrong label."""
 
-    def __init__(self, base_dataset: Dataset, num_classes: int, seed: int):
+    def __init__(self, base_dataset: Dataset, num_classes: int, seed: int, strategy: str = "cyclic"):
         """
         Initialize deterministic wrong labels for D_u.
 
@@ -185,23 +187,53 @@ class WrongLabelDataset(Dataset):
             base_dataset: Original forget subset.
             num_classes: Number of classes.
             seed: Seed controlling wrong-label assignment.
+            strategy: Wrong-label strategy: cyclic, permutation, or random.
         """
         self.base_dataset = base_dataset
         self.num_classes = int(num_classes)
+        self.strategy = str(strategy).lower()
         if self.num_classes < 2:
             raise ValueError("Amnesiac relabeling requires at least two classes.")
+        if self.strategy not in {"cyclic", "permutation", "random"}:
+            raise ValueError(f"Unsupported Amnesiac label strategy: {self.strategy}")
 
         generator = torch.Generator()
         generator.manual_seed(int(seed))
+        label_map = self._build_label_map(generator)
         self.wrong_labels = []
         self.true_labels = []
         for idx in range(len(self.base_dataset)):
             item = self.base_dataset[idx]
             label = self._extract_label(item)
-            offset = int(torch.randint(1, self.num_classes, (1,), generator=generator).item())
-            wrong_label = int((label + offset) % self.num_classes)
+            if self.strategy == "random":
+                offset = int(torch.randint(1, self.num_classes, (1,), generator=generator).item())
+                wrong_label = int((label + offset) % self.num_classes)
+            else:
+                wrong_label = int(label_map[int(label)])
             self.true_labels.append(int(label))
             self.wrong_labels.append(wrong_label)
+
+    def _build_label_map(self, generator: torch.Generator) -> Dict[int, int]:
+        """
+        Build a deterministic class-to-wrong-class mapping.
+
+        Args:
+            generator: Torch generator for seeded permutations.
+
+        Returns:
+            Mapping from true class id to wrong class id.
+        """
+        if self.strategy == "cyclic":
+            return {label: int((label + 1) % self.num_classes) for label in range(self.num_classes)}
+        if self.strategy == "permutation":
+            for _ in range(100):
+                permutation = torch.randperm(self.num_classes, generator=generator).tolist()
+                if all(int(permutation[label]) != label for label in range(self.num_classes)):
+                    return {label: int(permutation[label]) for label in range(self.num_classes)}
+            # Fallback is still a valid deterministic derangement.
+            permutation = [int((label + 1) % self.num_classes) for label in range(self.num_classes)]
+            return {label: int(permutation[label]) for label in range(self.num_classes)}
+        return {}
 
     def __len__(self) -> int:
         """
@@ -286,6 +318,7 @@ class AmnesiacUnlearner(BaseUnlearner):
         self.validate_every = int(self.config.get("amnesiac_validate_every", 1))
         self.train_scope = str(self.config.get("amnesiac_train_scope", "full")).lower()
         self.label_seed = int(self.config.get("amnesiac_label_seed", self.config.get("split_seed", 42)))
+        self.label_strategy = str(self.config.get("amnesiac_label_strategy", "cyclic")).lower()
 
     def _infer_target_tag(self) -> str:
         """
@@ -484,6 +517,7 @@ class AmnesiacUnlearner(BaseUnlearner):
             dataset.get_unlearning_set(),
             num_classes=int(self.config.get("num_classes", dataset.num_classes)),
             seed=self.label_seed,
+            strategy=self.label_strategy,
         )
         return DataLoader(
             wrong_dataset,
@@ -721,7 +755,8 @@ class AmnesiacUnlearner(BaseUnlearner):
             f"[AMNESIAC] hyper: optimizer={self.optimizer_name}, lr={self.lr}, "
             f"epochs={self.epochs}, relabel_w={self.relabel_weight}, retain_w={self.retain_weight}, "
             f"max_relabel_batches={self.max_relabel_batches}, max_retain_batches={self.max_retain_batches}, "
-            f"weight_decay={self.weight_decay}, grad_clip={self.grad_clip}, label_seed={self.label_seed}"
+            f"weight_decay={self.weight_decay}, grad_clip={self.grad_clip}, "
+            f"label_seed={self.label_seed}, label_strategy={self.label_strategy}"
         )
         print(f"[AMNESIAC] trainable parameters: {trainable_count}")
 
@@ -821,6 +856,7 @@ class AmnesiacUnlearner(BaseUnlearner):
                     "max_retain_batches": self.max_retain_batches,
                     "train_scope": self.train_scope,
                     "label_seed": self.label_seed,
+                    "label_strategy": self.label_strategy,
                 },
                 "seed": int(self.config.get("seed", 42)),
             },

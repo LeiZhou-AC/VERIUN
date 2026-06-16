@@ -76,6 +76,12 @@ checkpoint, relabels `D_u` with deterministic wrong labels, continues training
 on relabeled `D_u`, and uses a controlled number of `D_r` batches to preserve
 utility.
 
+Wrong-label strategies are configurable with `--label-strategy`:
+
+- `cyclic`: maps each class to `(y + 1) mod K` and is the default.
+- `permutation`: uses a seeded class derangement.
+- `random`: keeps the old per-sample random wrong-label behavior.
+
 Random sample-level split using an existing manifest:
 
 ```bash
@@ -85,7 +91,8 @@ python AMNESIAC_test.py \
   --split-mode random \
   --forget-ratio 0.01 \
   --forget-manifest-mode load \
-  --forget-manifest-path save/manifests/default_forget_manifest.json
+  --forget-manifest-path save/manifests/default_forget_manifest.json \
+  --label-strategy cyclic
 ```
 
 Class-level split:

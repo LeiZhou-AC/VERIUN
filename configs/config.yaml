@@ -40,3 +40,4 @@ amnesiac_grad_clip: 5.0
 amnesiac_validate_every: 1
 amnesiac_train_scope: full
 amnesiac_label_seed: 42
+amnesiac_label_strategy: cyclic
