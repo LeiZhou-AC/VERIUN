@@ -1,8 +1,9 @@
 """Representation Unlearning Verification (RUV).
 
 RUV supports representation-shift verification, RMS-kNN membership-footprint
-verification, representation augmentation stability verification, and
-activation-route shift verification.
+verification, representation augmentation stability verification,
+activation-route shift verification, and adversarial representation fragility
+verification.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from verification.base_verifier import BaseVerifier
 
 
 class RUVVerifier(BaseVerifier):
-    """Representation verifier for shift, RMS-kNN, RAS, and ARS evidence."""
+    """Representation verifier for shift, RMS-kNN, RAS, ARS, and ARF evidence."""
 
     def __init__(self, config: Optional[Dict] = None):
         """
@@ -57,6 +58,11 @@ class RUVVerifier(BaseVerifier):
         self.ars_top_fraction = float(self.config.get("ruv_ars_top_fraction", 0.1))
         self.ars_binary_weight = float(self.config.get("ruv_ars_binary_weight", 0.5))
         self.ars_threshold = float(self.config.get("ruv_ars_threshold", 0.0))
+        self.arf_epsilon = float(self.config.get("ruv_arf_epsilon", 8.0 / 255.0))
+        self.arf_step_size = float(self.config.get("ruv_arf_step_size", 2.0 / 255.0))
+        self.arf_steps = int(self.config.get("ruv_arf_steps", 5))
+        self.arf_distance = str(self.config.get("ruv_arf_distance", "cosine")).lower()
+        self.arf_random_start = bool(self.config.get("ruv_arf_random_start", False))
 
     def _parse_layers(self, raw_layers) -> Optional[List[str]]:
         """
@@ -618,6 +624,335 @@ class RUVVerifier(BaseVerifier):
         )
         print(f"[RUV][ARS] decision={result['decision']}")
         print("[RUV][ARS] ===== ARS Finished =====")
+        return result
+
+    def _input_bounds_for_batch(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build normalized input bounds and perturbation scales for ARF.
+
+        Args:
+            x: Input batch.
+
+        Returns:
+            Tuple of global lower bound, global upper bound, epsilon tensor,
+            and step-size tensor.
+        """
+        if not bool(self.config.get("normalize", True)):
+            lower = torch.zeros_like(x)
+            upper = torch.ones_like(x)
+            eps = torch.full_like(x[:, :1, :, :], self.arf_epsilon)
+            step = torch.full_like(x[:, :1, :, :], self.arf_step_size)
+            return lower, upper, eps, step
+
+        stats = {
+            "mnist": ((0.1307,), (0.3081,)),
+            "cifar10": ((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+            "cifar100": ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+            "svhn": ((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970)),
+            "stl10": ((0.4467, 0.4398, 0.4066), (0.2241, 0.2215, 0.2239)),
+        }
+        dataset_name = str(self.config.get("dataset", "cifar10")).lower()
+        mean_values, std_values = stats.get(dataset_name, stats["cifar10"])
+        channels = int(x.shape[1])
+        if len(mean_values) == 1 and channels > 1:
+            mean_values = tuple(mean_values[0] for _ in range(channels))
+            std_values = tuple(std_values[0] for _ in range(channels))
+
+        mean = torch.tensor(mean_values, device=x.device, dtype=x.dtype).view(1, channels, 1, 1)
+        std = torch.tensor(std_values, device=x.device, dtype=x.dtype).view(1, channels, 1, 1)
+        lower = (0.0 - mean) / std
+        upper = (1.0 - mean) / std
+        eps = torch.full_like(std, self.arf_epsilon) / std
+        step = torch.full_like(std, self.arf_step_size) / std
+        return lower, upper, eps, step
+
+    def _extract_layer_reps_for_grad(self, model, x: torch.Tensor, layers: Sequence[str]) -> Dict[str, torch.Tensor]:
+        """
+        Extract differentiable layer representations for ARF.
+
+        Args:
+            model: Model exposing representation extraction.
+            x: Input batch.
+            layers: Representation stages.
+
+        Returns:
+            Mapping from layer name to flattened tensors.
+        """
+        if hasattr(model, "extract_layer_representations"):
+            reps_by_layer = model.extract_layer_representations(x, layers=layers)
+        else:
+            if any(layer not in {"penultimate", "prelogit"} for layer in layers):
+                raise AttributeError(
+                    "This model does not expose extract_layer_representations; "
+                    "only prelogit ARF is available through extract_representation."
+                )
+            reps_by_layer = {layer: model.extract_representation(x) for layer in layers}
+        return {layer: torch.flatten(reps_by_layer[layer], start_dim=1) for layer in layers}
+
+    def _representation_distance(self, anchor: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-sample representation distance for ARF.
+
+        Args:
+            anchor: Clean representation.
+            candidate: Perturbed representation.
+
+        Returns:
+            Per-sample distances.
+        """
+        if self.arf_distance == "cosine":
+            anchor = F.normalize(anchor.float(), p=2, dim=1)
+            candidate = F.normalize(candidate.float(), p=2, dim=1)
+            return 1.0 - torch.sum(anchor * candidate, dim=1)
+        if self.arf_distance == "l2":
+            return torch.linalg.vector_norm(anchor.float() - candidate.float(), ord=2, dim=1)
+        raise ValueError(f"Unsupported ARF distance: {self.arf_distance}")
+
+    def extract_arf_scores(self, model, data_subset, layers: Sequence[str], seed_offset: int) -> Dict[str, np.ndarray]:
+        """
+        Extract Adversarial Representation Fragility scores.
+
+        Args:
+            model: Model exposing representation extraction.
+            data_subset: Dataset or subset.
+            layers: Representation stages.
+            seed_offset: Offset for deterministic random starts.
+
+        Returns:
+            Mapping from layer name to per-sample ARF scores.
+        """
+        if self.arf_steps <= 0:
+            raise ValueError("ruv_arf_steps must be positive.")
+
+        layers = self._deduplicate_layers(layers)
+        loader = DataLoader(
+            data_subset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.device.type == "cuda",
+        )
+        model = model.to(self.device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
+
+        scores = {layer: [] for layer in layers}
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.seed + int(seed_offset))
+
+        for batch in loader:
+            x = batch[0].to(self.device)
+            lower, upper, eps, step = self._input_bounds_for_batch(x)
+            lower = lower.expand_as(x)
+            upper = upper.expand_as(x)
+            eps = eps.expand_as(x)
+            step = step.expand_as(x)
+            with torch.no_grad():
+                clean_reps = {
+                    layer: reps.detach()
+                    for layer, reps in self._extract_layer_reps_for_grad(model, x, layers).items()
+                }
+
+            if self.arf_random_start:
+                random_delta = torch.empty(x.shape, dtype=x.dtype, device="cpu").uniform_(-1.0, 1.0, generator=generator)
+                delta = random_delta.to(self.device) * eps
+                x_adv = torch.max(torch.min(x + delta, upper), lower).detach()
+            else:
+                x_adv = x.detach()
+
+            local_lower = torch.max(x - eps, lower)
+            local_upper = torch.min(x + eps, upper)
+            for _ in range(self.arf_steps):
+                x_adv = x_adv.detach().requires_grad_(True)
+                adv_reps = self._extract_layer_reps_for_grad(model, x_adv, layers)
+                layer_losses = [
+                    self._representation_distance(clean_reps[layer], adv_reps[layer]).mean()
+                    for layer in layers
+                ]
+                loss = torch.stack(layer_losses).mean()
+                grad = torch.autograd.grad(loss, x_adv, retain_graph=False, create_graph=False)[0]
+                x_adv = x_adv + step * grad.sign()
+                x_adv = torch.max(torch.min(x_adv, local_upper), local_lower)
+                x_adv = torch.max(torch.min(x_adv, upper), lower).detach()
+
+            with torch.no_grad():
+                final_reps = self._extract_layer_reps_for_grad(model, x_adv, layers)
+                for layer in layers:
+                    layer_scores = self._representation_distance(clean_reps[layer], final_reps[layer])
+                    scores[layer].append(layer_scores.detach().cpu())
+
+        if any(not chunks for chunks in scores.values()):
+            raise ValueError("No ARF scores were extracted for at least one stage.")
+        return {layer: torch.cat(chunks, dim=0).numpy() for layer, chunks in scores.items()}
+
+    def _evaluate_arf_increase(
+        self,
+        target_before: np.ndarray,
+        target_after: np.ndarray,
+        control_before: np.ndarray,
+        control_after: np.ndarray,
+    ) -> Dict:
+        """
+        Evaluate target-specific adversarial fragility increase.
+
+        Args:
+            target_before: D_u ARF under M_s.
+            target_after: D_u ARF under M_u.
+            control_before: D_r' ARF under M_s.
+            control_after: D_r' ARF under M_u.
+
+        Returns:
+            Metric summary.
+        """
+        target_increase = target_after - target_before
+        control_increase = control_after - control_before
+        gap = self._compute_rug(target_increase, control_increase)
+        p_value = self._compute_p_value(target_increase, control_increase)
+        epsilon, null_gaps = self._permutation_test(target_increase, control_increase)
+        target_increase_p_value = self._safe_wilcoxon_greater(target_increase)
+        rejected = bool(p_value < self.alpha and gap > epsilon and np.mean(target_increase) > 0.0)
+        return {
+            "arf_before": self._summarize_scores(target_before),
+            "arf_after": self._summarize_scores(target_after),
+            "arf_increase": self._summarize_scores(target_increase),
+            "control_arf_before": self._summarize_scores(control_before),
+            "control_arf_after": self._summarize_scores(control_after),
+            "control_arf_increase": self._summarize_scores(control_increase),
+            "arf_gap": gap,
+            "p_value": p_value,
+            "target_increase_p_value": target_increase_p_value,
+            "epsilon": epsilon,
+            "rejected": rejected,
+            "decision": "adversarial_fragility_increase_detected" if rejected else "no_target_specific_fragility_increase",
+            "null_gap_mean": float(np.mean(null_gaps)) if null_gaps else None,
+            "null_gap_std": float(np.std(null_gaps)) if null_gaps else None,
+            "null_gap_quantile": epsilon,
+        }
+
+    def verify_arf(self, model_before, model_after, dataset) -> Dict:
+        """
+        Run Adversarial Representation Fragility verification.
+
+        Args:
+            model_before: Source model M_s before unlearning.
+            model_after: Unlearned model M_u to verify.
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Verification summary dictionary.
+        """
+        if model_before is None:
+            raise ValueError("ARF requires model_before as the original trained model M_s.")
+        if model_after is None:
+            raise ValueError("ARF requires model_after as the unlearned model M_u.")
+
+        granularity, primary_layers, control_layers = self._resolve_layer_plan()
+        if self.primary_layers is None and granularity == "sample":
+            primary_layers = ["middle", "late"]
+        if self.control_layers is None and granularity == "sample":
+            control_layers = ["stem"]
+        all_layers = self._deduplicate_layers(primary_layers + control_layers)
+        forget_set = dataset.get_unlearning_set()
+        retained_probe_set = self._sample_retained_subset(dataset)
+
+        print("[RUV][ARF] ===== Start Adversarial Representation Fragility Verification =====")
+        print(
+            f"[RUV][ARF] Setup: granularity={granularity}, primary_stages={primary_layers}, "
+            f"control_stages={control_layers}, epsilon={self.arf_epsilon}, "
+            f"step_size={self.arf_step_size}, steps={self.arf_steps}, "
+            f"distance={self.arf_distance}, random_start={self.arf_random_start}, "
+            f"D_u={len(forget_set)}, D_r'={len(retained_probe_set)}, "
+            f"permutations={self.num_permutations}"
+        )
+
+        print("[RUV][ARF] Extracting M_s fragility scores...")
+        du_before = self.extract_arf_scores(model_before, forget_set, all_layers, seed_offset=3000)
+        dr_before = self.extract_arf_scores(model_before, retained_probe_set, all_layers, seed_offset=4000)
+        print("[RUV][ARF] Extracting M_u fragility scores...")
+        du_after = self.extract_arf_scores(model_after, forget_set, all_layers, seed_offset=3000)
+        dr_after = self.extract_arf_scores(model_after, retained_probe_set, all_layers, seed_offset=4000)
+
+        stage_results = {}
+        for layer in all_layers:
+            stage_results[layer] = self._evaluate_arf_increase(
+                target_before=du_before[layer],
+                target_after=du_after[layer],
+                control_before=dr_before[layer],
+                control_after=dr_after[layer],
+            )
+            print(
+                f"[RUV][ARF][Stage:{layer}] "
+                f"increase={stage_results[layer]['arf_increase']['mean']:.6f} "
+                f"control_increase={stage_results[layer]['control_arf_increase']['mean']:.6f} "
+                f"gap={stage_results[layer]['arf_gap']:.6f} "
+                f"p_value={stage_results[layer]['p_value']:.6g} "
+                f"epsilon={stage_results[layer]['epsilon']:.6f}"
+            )
+
+        primary_before = np.mean(np.stack([du_before[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_after = np.mean(np.stack([du_after[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_before = np.mean(np.stack([dr_before[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_after = np.mean(np.stack([dr_after[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_result = self._evaluate_arf_increase(
+            target_before=primary_before,
+            target_after=primary_after,
+            control_before=primary_control_before,
+            control_after=primary_control_after,
+        )
+
+        result = {
+            "status": "ok",
+            "method": "arf",
+            "full_name": "Adversarial Representation Fragility",
+            "representation_name": "Model Representation Robustness Landscape",
+            "metric": "ARF Fragility Increase Gap",
+            "granularity": granularity,
+            "primary_stages": primary_layers,
+            "control_stages": control_layers,
+            "arf_epsilon": self.arf_epsilon,
+            "arf_step_size": self.arf_step_size,
+            "arf_steps": self.arf_steps,
+            "arf_distance": self.arf_distance,
+            "arf_random_start": self.arf_random_start,
+            "arf_gap": primary_result["arf_gap"],
+            "p_value": primary_result["p_value"],
+            "target_increase_p_value": primary_result["target_increase_p_value"],
+            "epsilon": primary_result["epsilon"],
+            "alpha": self.alpha,
+            "rejected": primary_result["rejected"],
+            "decision": primary_result["decision"],
+            "interpretation": (
+                "D_u shows a target-specific adversarial representation fragility increase."
+                if primary_result["rejected"]
+                else "No statistically significant target-specific adversarial fragility increase was detected."
+            ),
+            "arf_before": primary_result["arf_before"],
+            "arf_after": primary_result["arf_after"],
+            "arf_increase": primary_result["arf_increase"],
+            "control_arf_before": primary_result["control_arf_before"],
+            "control_arf_after": primary_result["control_arf_after"],
+            "control_arf_increase": primary_result["control_arf_increase"],
+            "stage_results": stage_results,
+            "num_forget": int(len(primary_before)),
+            "num_retained_probe": int(len(primary_control_before)),
+            "num_permutations": self.num_permutations,
+            "null_gap_mean": primary_result["null_gap_mean"],
+            "null_gap_std": primary_result["null_gap_std"],
+            "null_gap_quantile": primary_result["null_gap_quantile"],
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+        }
+
+        print(
+            f"[RUV][ARF][Primary] increase={result['arf_increase']['mean']:.6f} "
+            f"control_increase={result['control_arf_increase']['mean']:.6f} "
+            f"gap={result['arf_gap']:.6f} p_value={result['p_value']:.6g} "
+            f"epsilon={result['epsilon']:.6f}"
+        )
+        print(f"[RUV][ARF] decision={result['decision']}")
+        print("[RUV][ARF] ===== ARF Finished =====")
         return result
 
     def _sample_local_indices(self, total_size: int, sample_size: int, rng: np.random.Generator) -> List[int]:
@@ -1311,6 +1646,8 @@ class RUVVerifier(BaseVerifier):
             return self.verify_rms_knn(model_before, model_after, dataset)
         if self.metric in {"ars", "activation_route", "activation_route_shift", "route_shift"}:
             return self.verify_ars(model_before, model_after, dataset)
+        if self.metric in {"arf", "adversarial_fragility", "adv_fragility", "representation_fragility"}:
+            return self.verify_arf(model_before, model_after, dataset)
 
         granularity, primary_layers, control_layers = self._resolve_layer_plan()
         all_layers = self._deduplicate_layers(primary_layers + control_layers)

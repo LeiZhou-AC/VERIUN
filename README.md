@@ -139,3 +139,19 @@ python RUV_test.py \
   --forget-manifest-mode load \
   --forget-manifest-path save/manifests/default_forget_manifest.json
 ```
+
+ARF adversarial representation fragility verification can be selected with:
+
+```bash
+python RUV_test.py \
+  --ruv-metric arf \
+  --ruv-mode sample \
+  --ruv-layers middle,late \
+  --ruv-control-layers stem \
+  --arf-epsilon 0.031372549 \
+  --arf-step-size 0.007843137 \
+  --arf-steps 5 \
+  --unlearned-model-path save/weights/unlearned/<checkpoint>.pt \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/default_forget_manifest.json
+```

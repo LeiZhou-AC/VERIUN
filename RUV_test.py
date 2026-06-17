@@ -92,7 +92,7 @@ def _build_args() -> argparse.Namespace:
 
     parser.add_argument("--original-model-path", type=str, default="save/weights/trained")
     parser.add_argument("--unlearned-model-path", type=str, default="save/weights/unlearned")
-    parser.add_argument("--ruv-metric", type=str, default="ras", choices=["shift", "rms_knn", "ras", "ars"])
+    parser.add_argument("--ruv-metric", type=str, default="ras", choices=["shift", "rms_knn", "ras", "ars", "arf"])
     parser.add_argument("--ruv-mode", type=str, default="auto", choices=["auto", "class", "sample"])
     parser.add_argument("--ruv-layers", type=str, default="")
     parser.add_argument("--ruv-control-layers", type=str, default="")
@@ -108,6 +108,11 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--ars-top-fraction", type=float, default=0.1)
     parser.add_argument("--ars-binary-weight", type=float, default=0.5)
     parser.add_argument("--ars-threshold", type=float, default=0.0)
+    parser.add_argument("--arf-epsilon", type=float, default=8.0 / 255.0)
+    parser.add_argument("--arf-step-size", type=float, default=2.0 / 255.0)
+    parser.add_argument("--arf-steps", type=int, default=5)
+    parser.add_argument("--arf-distance", type=str, default="cosine", choices=["cosine", "l2"])
+    parser.add_argument("--arf-random-start", action="store_true")
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--num-permutations", type=int, default=100)
     parser.add_argument("--result-dir", type=str, default="save/results/ruv")
@@ -159,6 +164,11 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "ruv_ars_top_fraction": args.ars_top_fraction,
             "ruv_ars_binary_weight": args.ars_binary_weight,
             "ruv_ars_threshold": args.ars_threshold,
+            "ruv_arf_epsilon": args.arf_epsilon,
+            "ruv_arf_step_size": args.arf_step_size,
+            "ruv_arf_steps": args.arf_steps,
+            "ruv_arf_distance": args.arf_distance,
+            "ruv_arf_random_start": bool(args.arf_random_start),
             "ruv_alpha": args.alpha,
             "ruv_num_permutations": args.num_permutations,
         }

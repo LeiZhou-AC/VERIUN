@@ -27,6 +27,11 @@ ruv_ras_noise_std: 0.0
 ruv_ars_top_fraction: 0.1
 ruv_ars_binary_weight: 0.5
 ruv_ars_threshold: 0.0
+ruv_arf_epsilon: 0.031372549
+ruv_arf_step_size: 0.007843137
+ruv_arf_steps: 5
+ruv_arf_distance: cosine
+ruv_arf_random_start: False
 ruv_alpha: 0.05
 ruv_num_permutations: 100
 
