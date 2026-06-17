@@ -24,6 +24,9 @@ ruv_ras_num_views: 8
 ruv_ras_crop_padding: 4
 ruv_ras_hflip_prob: 0.5
 ruv_ras_noise_std: 0.0
+ruv_ars_top_fraction: 0.1
+ruv_ars_binary_weight: 0.5
+ruv_ars_threshold: 0.0
 ruv_alpha: 0.05
 ruv_num_permutations: 100
 

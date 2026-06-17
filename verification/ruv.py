@@ -1,7 +1,8 @@
 """Representation Unlearning Verification (RUV).
 
 RUV supports representation-shift verification, RMS-kNN membership-footprint
-verification, and representation augmentation stability verification.
+verification, representation augmentation stability verification, and
+activation-route shift verification.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from verification.base_verifier import BaseVerifier
 
 
 class RUVVerifier(BaseVerifier):
-    """Representation verifier for shift, RMS-kNN, and RAS evidence."""
+    """Representation verifier for shift, RMS-kNN, RAS, and ARS evidence."""
 
     def __init__(self, config: Optional[Dict] = None):
         """
@@ -53,6 +54,9 @@ class RUVVerifier(BaseVerifier):
         self.ras_crop_padding = int(self.config.get("ruv_ras_crop_padding", 4))
         self.ras_hflip_prob = float(self.config.get("ruv_ras_hflip_prob", 0.5))
         self.ras_noise_std = float(self.config.get("ruv_ras_noise_std", 0.0))
+        self.ars_top_fraction = float(self.config.get("ruv_ars_top_fraction", 0.1))
+        self.ars_binary_weight = float(self.config.get("ruv_ars_binary_weight", 0.5))
+        self.ars_threshold = float(self.config.get("ruv_ars_threshold", 0.0))
 
     def _parse_layers(self, raw_layers) -> Optional[List[str]]:
         """
@@ -429,6 +433,192 @@ class RUVVerifier(BaseVerifier):
             "null_rug_std": float(np.std(null_rugs)) if null_rugs else None,
             "null_rug_quantile": epsilon,
         }
+
+    def _topk_route_disagreement(
+        self,
+        z_before: np.ndarray,
+        z_after: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compute top-active-neuron route disagreement per sample.
+
+        Args:
+            z_before: Representation states from M_s.
+            z_after: Representation states from M_u.
+
+        Returns:
+            Per-sample disagreement in [0, 1].
+        """
+        if z_before.shape != z_after.shape:
+            raise ValueError(
+                f"Feature shapes do not match for ARS: before={z_before.shape}, after={z_after.shape}"
+            )
+        dim = int(z_before.shape[1])
+        top_fraction = min(max(self.ars_top_fraction, 0.0), 1.0)
+        k = max(1, int(round(dim * top_fraction)))
+        k = min(k, dim)
+
+        before_scores = np.abs(z_before)
+        after_scores = np.abs(z_after)
+        before_top = np.argpartition(before_scores, -k, axis=1)[:, -k:]
+        after_top = np.argpartition(after_scores, -k, axis=1)[:, -k:]
+
+        disagreements = []
+        for row_before, row_after in zip(before_top, after_top):
+            overlap = len(set(row_before.tolist()).intersection(row_after.tolist()))
+            disagreements.append(1.0 - overlap / float(k))
+        return np.asarray(disagreements, dtype=np.float64)
+
+    def compute_activation_route_scores_from_features(
+        self,
+        z_before: np.ndarray,
+        z_after: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compute Activation Route Shift scores from paired representation states.
+
+        ARS combines binary activation-state flips and top-active-neuron route
+        disagreement. The binary term captures ReLU-style on/off changes, while
+        the top-k term captures route rewiring among the strongest channels.
+
+        Args:
+            z_before: Representation states from M_s.
+            z_after: Representation states from M_u.
+
+        Returns:
+            Per-sample ARS scores.
+        """
+        if z_before.shape != z_after.shape:
+            raise ValueError(
+                f"Feature shapes do not match for ARS: before={z_before.shape}, after={z_after.shape}"
+            )
+
+        before_active = z_before > self.ars_threshold
+        after_active = z_after > self.ars_threshold
+        binary_flip = np.mean(np.logical_xor(before_active, after_active), axis=1).astype(np.float64)
+        topk_disagreement = self._topk_route_disagreement(z_before, z_after)
+        binary_weight = min(max(self.ars_binary_weight, 0.0), 1.0)
+        return binary_weight * binary_flip + (1.0 - binary_weight) * topk_disagreement
+
+    def verify_ars(self, model_before, model_after, dataset) -> Dict:
+        """
+        Run Activation Route Shift verification.
+
+        Args:
+            model_before: Source model M_s before unlearning.
+            model_after: Unlearned model M_u to verify.
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Verification summary dictionary.
+        """
+        if model_before is None:
+            raise ValueError("ARS requires model_before as the original trained model M_s.")
+        if model_after is None:
+            raise ValueError("ARS requires model_after as the unlearned model M_u.")
+
+        granularity, primary_layers, control_layers = self._resolve_layer_plan()
+        if self.primary_layers is None and granularity == "sample":
+            primary_layers = ["stem", "early", "middle"]
+        if self.control_layers is None and granularity == "sample":
+            control_layers = ["late"]
+        all_layers = self._deduplicate_layers(primary_layers + control_layers)
+
+        print("[RUV][ARS] ===== Start Activation Route Shift Verification =====")
+        forget_set = dataset.get_unlearning_set()
+        retained_probe_set = self._sample_retained_subset(dataset)
+        print(
+            f"[RUV][ARS] Setup: granularity={granularity}, primary_stages={primary_layers}, "
+            f"control_stages={control_layers}, top_fraction={self.ars_top_fraction}, "
+            f"binary_weight={self.ars_binary_weight}, threshold={self.ars_threshold}, "
+            f"D_u={len(forget_set)}, D_r'={len(retained_probe_set)}, "
+            f"permutations={self.num_permutations}"
+        )
+
+        print("[RUV][ARS] Extracting activation routes on D_u...")
+        du_before = self.extract_feature_dict(model_before, forget_set, all_layers)
+        du_after = self.extract_feature_dict(model_after, forget_set, all_layers)
+        print("[RUV][ARS] Extracting activation routes on D_r'...")
+        dr_before = self.extract_feature_dict(model_before, retained_probe_set, all_layers)
+        dr_after = self.extract_feature_dict(model_after, retained_probe_set, all_layers)
+
+        stage_results = {}
+        du_scores_by_layer = {}
+        dr_scores_by_layer = {}
+        for layer in all_layers:
+            scores_u = self.compute_activation_route_scores_from_features(du_before[layer], du_after[layer])
+            scores_r = self.compute_activation_route_scores_from_features(dr_before[layer], dr_after[layer])
+            du_scores_by_layer[layer] = scores_u
+            dr_scores_by_layer[layer] = scores_r
+            stage_results[layer] = self._evaluate_score_pair(scores_u, scores_r)
+            print(
+                f"[RUV][ARS][Stage:{layer}] arg={stage_results[layer]['rug']:.6f} "
+                f"p_value={stage_results[layer]['p_value']:.6g} "
+                f"epsilon={stage_results[layer]['epsilon']:.6f} "
+                f"mean_du={stage_results[layer]['forget_scores']['mean']:.6f} "
+                f"mean_dr={stage_results[layer]['retained_scores']['mean']:.6f}"
+            )
+
+        primary_du_scores = np.mean(
+            np.stack([du_scores_by_layer[layer] for layer in primary_layers], axis=0),
+            axis=0,
+        )
+        primary_dr_scores = np.mean(
+            np.stack([dr_scores_by_layer[layer] for layer in primary_layers], axis=0),
+            axis=0,
+        )
+        primary_result = self._evaluate_score_pair(primary_du_scores, primary_dr_scores)
+
+        result = {
+            "status": "ok",
+            "method": "ars",
+            "full_name": "Activation Route Shift",
+            "representation_name": "Model Activation Route",
+            "metric": "Activation Route Gap",
+            "granularity": granularity,
+            "primary_stages": primary_layers,
+            "control_stages": control_layers,
+            "ars_top_fraction": self.ars_top_fraction,
+            "ars_binary_weight": self.ars_binary_weight,
+            "ars_threshold": self.ars_threshold,
+            "arg": primary_result["rug"],
+            "p_value": primary_result["p_value"],
+            "epsilon": primary_result["epsilon"],
+            "alpha": self.alpha,
+            "rejected": primary_result["rejected"],
+            "decision": (
+                "activation_route_shift_detected"
+                if primary_result["rejected"]
+                else "no_target_specific_activation_route_shift"
+            ),
+            "interpretation": (
+                "D_u shows a target-specific activation-route shift after unlearning."
+                if primary_result["rejected"]
+                else "No statistically significant target-specific activation-route shift was detected."
+            ),
+            "forget_scores": primary_result["forget_scores"],
+            "retained_scores": primary_result["retained_scores"],
+            "stage_results": stage_results,
+            "num_forget": int(len(primary_du_scores)),
+            "num_retained_probe": int(len(primary_dr_scores)),
+            "num_permutations": self.num_permutations,
+            "null_arg_mean": primary_result["null_rug_mean"],
+            "null_arg_std": primary_result["null_rug_std"],
+            "null_arg_quantile": primary_result["null_rug_quantile"],
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+        }
+
+        print(
+            f"[RUV][ARS][Primary] arg={result['arg']:.6f} p_value={result['p_value']:.6g} "
+            f"epsilon={result['epsilon']:.6f} "
+            f"mean_du={result['forget_scores']['mean']:.6f} "
+            f"mean_dr={result['retained_scores']['mean']:.6f}"
+        )
+        print(f"[RUV][ARS] decision={result['decision']}")
+        print("[RUV][ARS] ===== ARS Finished =====")
+        return result
 
     def _sample_local_indices(self, total_size: int, sample_size: int, rng: np.random.Generator) -> List[int]:
         """
@@ -1119,6 +1309,8 @@ class RUVVerifier(BaseVerifier):
             return self.verify_ras(model_before, model_after, dataset)
         if self.metric in {"rms", "rms_knn", "rms-knn", "membership", "membership_knn"}:
             return self.verify_rms_knn(model_before, model_after, dataset)
+        if self.metric in {"ars", "activation_route", "activation_route_shift", "route_shift"}:
+            return self.verify_ars(model_before, model_after, dataset)
 
         granularity, primary_layers, control_layers = self._resolve_layer_plan()
         all_layers = self._deduplicate_layers(primary_layers + control_layers)

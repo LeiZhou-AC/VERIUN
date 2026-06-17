@@ -126,3 +126,16 @@ python RUV_test.py \
   --forget-manifest-mode load \
   --forget-manifest-path save/manifests/default_forget_manifest.json
 ```
+
+ARS activation-route verification can be selected with:
+
+```bash
+python RUV_test.py \
+  --ruv-metric ars \
+  --ruv-mode sample \
+  --ruv-layers stem,early,middle \
+  --ruv-control-layers late \
+  --unlearned-model-path save/weights/unlearned/<checkpoint>.pt \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/default_forget_manifest.json
+```
