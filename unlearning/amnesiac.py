@@ -1066,6 +1066,13 @@ class AmnesiacUnlearner(BaseUnlearner):
         manifest_path = dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
         manifest_info = dataset.get_forget_manifest_info() if hasattr(dataset, "get_forget_manifest_info") else None
 
+        print("[AMNESIAC][Log] Evaluating trained model before update removal...")
+        pre_unlearn_eval = {
+            "forget": self._evaluate_split(model, forget_loader, "forget_before"),
+            "retain": self._evaluate_split(model, retain_loader, "retain_before"),
+            "test": self._evaluate_split(model, test_loader, "test_before"),
+        }
+
         trained_checkpoint = {
             "state_dict": copy.deepcopy(model.state_dict()),
             "method": "amnesiac_log_original_training",
@@ -1091,6 +1098,7 @@ class AmnesiacUnlearner(BaseUnlearner):
                 "forget_manifest_path": manifest_path,
                 "forget_manifest": manifest_info,
                 "train_history": train_history,
+                "pre_unlearn_eval": pre_unlearn_eval,
             },
             str(log_path),
         )
@@ -1133,6 +1141,7 @@ class AmnesiacUnlearner(BaseUnlearner):
                     "repair_batches": self.repair_batches,
                 },
                 "final_eval": final_eval,
+                "pre_unlearn_eval": pre_unlearn_eval,
                 "repair_stats": repair_stats,
                 "seed": int(self.config.get("seed", 42)),
             },
@@ -1157,6 +1166,7 @@ class AmnesiacUnlearner(BaseUnlearner):
                         "repair_batches": self.repair_batches,
                     },
                     "train_history": train_history,
+                    "pre_unlearn_eval": pre_unlearn_eval,
                     "repair_stats": repair_stats,
                     "final_eval": final_eval,
                 },
@@ -1177,6 +1187,7 @@ class AmnesiacUnlearner(BaseUnlearner):
             "log_path": str(log_path),
             "summary_path": str(summary_path),
             "history": train_history,
+            "pre_unlearn_eval": pre_unlearn_eval,
             "final_eval": final_eval,
             "repair_stats": repair_stats,
             "forget_manifest_path": manifest_path,

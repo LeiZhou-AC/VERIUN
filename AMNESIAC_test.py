@@ -183,6 +183,40 @@ def _ensure_path_ready(path_value: str) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def _print_eval_summary(result: dict) -> None:
+    """
+    Print full-split evaluation metrics before and after unlearning.
+
+    Args:
+        result: Unlearner result dictionary.
+    """
+    pre_eval = result.get("pre_unlearn_eval") or {}
+    final_eval = result.get("final_eval") or {}
+    if not pre_eval and not final_eval:
+        return
+
+    print("[AMNESIAC_TEST] ===== Full-Split Evaluation Summary =====")
+    for split in ("forget", "retain", "test"):
+        before = pre_eval.get(split, {})
+        after = final_eval.get(split, {})
+        before_acc = before.get("accuracy")
+        after_acc = after.get("accuracy")
+        if before_acc is None and after_acc is None:
+            continue
+        if before_acc is None:
+            print(f"[AMNESIAC_TEST][{split}] after_acc={after_acc:.4f}")
+            continue
+        if after_acc is None:
+            print(f"[AMNESIAC_TEST][{split}] before_acc={before_acc:.4f}")
+            continue
+        print(
+            f"[AMNESIAC_TEST][{split}] "
+            f"before_acc={before_acc:.4f} "
+            f"after_acc={after_acc:.4f} "
+            f"delta={after_acc - before_acc:+.4f}"
+        )
+
+
 def main() -> None:
     """Run Amnesiac relabel approximate unlearning from the project root."""
     args = _build_args()
@@ -232,7 +266,8 @@ def main() -> None:
     print(f"[AMNESIAC_TEST] Forget manifest path: {result.get('forget_manifest_path')}")
     print(f"[AMNESIAC_TEST] Epoch logs: {len(result.get('history', []))}")
     if result.get("history"):
-        print(f"[AMNESIAC_TEST] Final epoch metrics: {result['history'][-1]}")
+        print(f"[AMNESIAC_TEST] Final training epoch metrics: {result['history'][-1]}")
+    _print_eval_summary(result)
 
 
 if __name__ == "__main__":
