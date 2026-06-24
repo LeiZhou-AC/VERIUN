@@ -45,6 +45,17 @@ amnesiac_lr: 0.0001
 amnesiac_optimizer: adamw
 amnesiac_momentum: 0.9
 amnesiac_weight_decay: 0.0005
+amnesiac_mode: log
+amnesiac_original_epochs: 50
+amnesiac_original_lr: 0.01
+amnesiac_original_optimizer: sgd
+amnesiac_original_momentum: 0.9
+amnesiac_original_weight_decay: 0.0005
+amnesiac_log_dir: save/unlearning_logs/amnesiac
+amnesiac_log_scale: 1.0
+amnesiac_repair_epochs: 5
+amnesiac_repair_lr: 0.001
+amnesiac_repair_batches: 0
 amnesiac_relabel_weight: 1.0
 amnesiac_retain_weight: 0.5
 amnesiac_max_relabel_batches: 0

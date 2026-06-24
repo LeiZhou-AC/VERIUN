@@ -466,6 +466,14 @@ class SalUnUnlearner(BaseUnlearner):
             x = x.to(self.device)
             wrong_y = wrong_y.to(self.device)
             true_y = true_y.to(self.device)
+            if self.label_strategy == "random_any":
+                # Official SalUn RL samples replacement labels on the fly.
+                wrong_y = torch.randint(
+                    0,
+                    int(self.config.get("num_classes", 10)),
+                    true_y.shape,
+                    device=self.device,
+                )
             optimizer.zero_grad()
             logits = model(x)
             ce_loss = F.cross_entropy(logits, wrong_y)

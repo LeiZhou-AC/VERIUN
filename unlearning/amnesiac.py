@@ -1,20 +1,22 @@
-"""Amnesiac relabeling baseline for approximate machine unlearning.
+"""Amnesiac baselines for machine unlearning.
 
-This module implements a practical variant of Amnesiac Machine Learning for
-post-hoc experiments where the original batch-update logs are unavailable. The
-forget set is relabeled with deterministic wrong labels and the trained model is
-continued on relabeled D_u plus a controlled amount of retained data D_r.
+This module contains two modes:
+1) ``log``: train an original model while logging the parameter updates caused
+   by forget-only batches, then remove those updates from the trained model.
+2) ``relabel``: a practical post-hoc wrong-label baseline kept for comparison
+   when original update logs are unavailable.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -80,6 +82,17 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--unlearned-path", type=str, default=None)
     parser.add_argument("--save-name", type=str, default=None)
 
+    parser.add_argument("--mode", type=str, default=None, choices=["log", "relabel"])
+    parser.add_argument("--original-epochs", type=int, default=None)
+    parser.add_argument("--original-lr", type=float, default=None)
+    parser.add_argument("--original-optimizer", type=str, default=None, choices=["adamw", "sgd"])
+    parser.add_argument("--original-momentum", type=float, default=None)
+    parser.add_argument("--original-weight-decay", type=float, default=None)
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--log-scale", type=float, default=None)
+    parser.add_argument("--repair-epochs", type=int, default=None)
+    parser.add_argument("--repair-lr", type=float, default=None)
+    parser.add_argument("--repair-batches", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--optimizer", type=str, default=None, choices=["adamw", "sgd"])
@@ -142,6 +155,17 @@ def _merge_config(base_cfg: Dict, args: argparse.Namespace) -> Dict:
     if args.allow_download:
         cfg["allow_download"] = True
 
+    set_from_arg("amnesiac_mode", args.mode)
+    set_from_arg("amnesiac_original_epochs", args.original_epochs)
+    set_from_arg("amnesiac_original_lr", args.original_lr)
+    set_from_arg("amnesiac_original_optimizer", args.original_optimizer)
+    set_from_arg("amnesiac_original_momentum", args.original_momentum)
+    set_from_arg("amnesiac_original_weight_decay", args.original_weight_decay)
+    set_from_arg("amnesiac_log_dir", args.log_dir)
+    set_from_arg("amnesiac_log_scale", args.log_scale)
+    set_from_arg("amnesiac_repair_epochs", args.repair_epochs)
+    set_from_arg("amnesiac_repair_lr", args.repair_lr)
+    set_from_arg("amnesiac_repair_batches", args.repair_batches)
     set_from_arg("amnesiac_epochs", args.epochs)
     set_from_arg("amnesiac_lr", args.lr)
     set_from_arg("amnesiac_optimizer", args.optimizer)
@@ -289,7 +313,7 @@ class AmnesiacEpochStats:
 
 
 class AmnesiacUnlearner(BaseUnlearner):
-    """Approximate unlearner based on deterministic wrong-label updates."""
+    """Amnesiac unlearner with log-based and relabel-based modes."""
 
     def __init__(self, config: Dict):
         """
@@ -305,6 +329,7 @@ class AmnesiacUnlearner(BaseUnlearner):
         if self.device.type == "cuda" and not torch.cuda.is_available():
             self.device = torch.device("cpu")
 
+        self.mode = str(self.config.get("amnesiac_mode", "log")).lower()
         self.epochs = int(self.config.get("amnesiac_epochs", self.config.get("epochs", 10)))
         self.lr = float(self.config.get("amnesiac_lr", self.config.get("lr", 1e-4)))
         self.optimizer_name = str(self.config.get("amnesiac_optimizer", "adamw")).lower()
@@ -319,6 +344,26 @@ class AmnesiacUnlearner(BaseUnlearner):
         self.train_scope = str(self.config.get("amnesiac_train_scope", "full")).lower()
         self.label_seed = int(self.config.get("amnesiac_label_seed", self.config.get("split_seed", 42)))
         self.label_strategy = str(self.config.get("amnesiac_label_strategy", "cyclic")).lower()
+        self.original_epochs = int(
+            self.config.get("amnesiac_original_epochs", self.config.get("epochs", 50))
+        )
+        self.original_lr = float(
+            self.config.get("amnesiac_original_lr", self.config.get("lr", 0.01))
+        )
+        self.original_optimizer_name = str(
+            self.config.get("amnesiac_original_optimizer", self.config.get("optimizer", "sgd"))
+        ).lower()
+        self.original_momentum = float(
+            self.config.get("amnesiac_original_momentum", self.config.get("momentum", 0.9))
+        )
+        self.original_weight_decay = float(
+            self.config.get("amnesiac_original_weight_decay", self.config.get("weight_decay", 5e-4))
+        )
+        self.log_dir = Path(str(self.config.get("amnesiac_log_dir", "save/unlearning_logs/amnesiac")))
+        self.log_scale = float(self.config.get("amnesiac_log_scale", 1.0))
+        self.repair_epochs = int(self.config.get("amnesiac_repair_epochs", 5))
+        self.repair_lr = float(self.config.get("amnesiac_repair_lr", max(self.original_lr * 0.1, 1e-5)))
+        self.repair_batches = int(self.config.get("amnesiac_repair_batches", 0))
 
     def _infer_target_tag(self) -> str:
         """
@@ -473,12 +518,23 @@ class AmnesiacUnlearner(BaseUnlearner):
         elif self.train_scope != "full":
             raise ValueError(f"Unsupported Amnesiac train scope: {self.train_scope}")
 
-    def _build_optimizer(self, model: nn.Module):
+    def _build_optimizer(
+        self,
+        model: nn.Module,
+        lr: Optional[float] = None,
+        optimizer_name: Optional[str] = None,
+        weight_decay: Optional[float] = None,
+        momentum: Optional[float] = None,
+    ):
         """
         Build an optimizer over trainable parameters.
 
         Args:
             model: Model to update.
+            lr: Optional learning rate override.
+            optimizer_name: Optional optimizer name override.
+            weight_decay: Optional weight decay override.
+            momentum: Optional SGD momentum override.
 
         Returns:
             Optimizer instance.
@@ -486,9 +542,13 @@ class AmnesiacUnlearner(BaseUnlearner):
         params = [p for p in model.parameters() if p.requires_grad]
         if not params:
             raise RuntimeError("No trainable parameters found for Amnesiac.")
-        if self.optimizer_name == "sgd":
-            return SGD(params, lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
-        return AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        opt_name = str(optimizer_name or self.optimizer_name).lower()
+        opt_lr = float(self.lr if lr is None else lr)
+        opt_weight_decay = float(self.weight_decay if weight_decay is None else weight_decay)
+        opt_momentum = float(self.momentum if momentum is None else momentum)
+        if opt_name == "sgd":
+            return SGD(params, lr=opt_lr, momentum=opt_momentum, weight_decay=opt_weight_decay)
+        return AdamW(params, lr=opt_lr, weight_decay=opt_weight_decay)
 
     def _maybe_clip_gradients(self, model: nn.Module) -> None:
         """
@@ -720,9 +780,412 @@ class AmnesiacUnlearner(BaseUnlearner):
         )
         return metrics
 
+    def _init_delta_buffer(self, model: nn.Module) -> Dict[str, torch.Tensor]:
+        """
+        Create a CPU buffer for accumulating forget-batch parameter updates.
+
+        Args:
+            model: Model whose trainable parameters are logged.
+
+        Returns:
+            Mapping from parameter name to cumulative update tensor.
+        """
+        return {
+            name: torch.zeros_like(param.detach(), device="cpu", dtype=torch.float32)
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+    def _record_parameter_delta(
+        self,
+        model: nn.Module,
+        before: Dict[str, torch.Tensor],
+        delta_buffer: Dict[str, torch.Tensor],
+    ) -> None:
+        """
+        Add the latest optimizer step to the forget-update buffer.
+
+        Args:
+            model: Model after an optimizer step.
+            before: CPU parameter snapshot before the step.
+            delta_buffer: Cumulative CPU update buffer to mutate.
+        """
+        for name, param in model.named_parameters():
+            if name in delta_buffer:
+                delta_buffer[name].add_(param.detach().cpu().float() - before[name])
+
+    def _run_logged_train_epoch(
+        self,
+        model: nn.Module,
+        retain_loader: DataLoader,
+        forget_loader: DataLoader,
+        optimizer,
+        delta_buffer: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        Train one epoch with separated retain and forget phases.
+
+        Forget batches are ordinary training batches, but their parameter
+        updates are accumulated so they can be removed later.
+
+        Args:
+            model: Model being trained from scratch.
+            retain_loader: Retained-data loader.
+            forget_loader: Forget-data loader.
+            optimizer: Optimizer shared by both phases.
+            delta_buffer: Cumulative forget-update log.
+
+        Returns:
+            Training metrics for the epoch.
+        """
+        model.train()
+        retain_loss = 0.0
+        retain_correct = 0
+        retain_total = 0
+        forget_loss = 0.0
+        forget_correct = 0
+        forget_total = 0
+        criterion = nn.CrossEntropyLoss()
+
+        for x, y in retain_loader:
+            x = x.to(self.device)
+            y = y.to(self.device)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            self._maybe_clip_gradients(model)
+            optimizer.step()
+
+            batch_size = int(y.size(0))
+            retain_loss += float(loss.item()) * batch_size
+            retain_correct += int((logits.argmax(dim=1) == y).sum().item())
+            retain_total += batch_size
+
+        for x, y in forget_loader:
+            x = x.to(self.device)
+            y = y.to(self.device)
+            before = {
+                name: param.detach().cpu().float().clone()
+                for name, param in model.named_parameters()
+                if name in delta_buffer
+            }
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            self._maybe_clip_gradients(model)
+            optimizer.step()
+            self._record_parameter_delta(model, before, delta_buffer)
+
+            batch_size = int(y.size(0))
+            forget_loss += float(loss.item()) * batch_size
+            forget_correct += int((logits.argmax(dim=1) == y).sum().item())
+            forget_total += batch_size
+
+        return {
+            "retain_train_loss": retain_loss / max(retain_total, 1),
+            "retain_train_accuracy": retain_correct / max(retain_total, 1),
+            "forget_train_loss": forget_loss / max(forget_total, 1),
+            "forget_train_accuracy": forget_correct / max(forget_total, 1),
+            "retain_steps": float(len(retain_loader)),
+            "forget_steps": float(len(forget_loader)),
+        }
+
+    def _apply_forget_delta(self, model: nn.Module, delta_buffer: Dict[str, torch.Tensor]) -> None:
+        """
+        Remove the logged forget updates from a trained model.
+
+        Args:
+            model: Trained model to modify in place.
+            delta_buffer: Cumulative forget-update log.
+        """
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in delta_buffer:
+                    param.sub_(delta_buffer[name].to(param.device, dtype=param.dtype) * self.log_scale)
+
+    def _repair_on_retain(self, model: nn.Module, retain_loader: DataLoader) -> Dict[str, float]:
+        """
+        Optionally repair utility after subtracting forget updates.
+
+        Args:
+            model: Model after forget-log subtraction.
+            retain_loader: Retained-data loader.
+
+        Returns:
+            Last repair epoch metrics.
+        """
+        if self.repair_epochs <= 0:
+            return {"repair_loss": 0.0, "repair_accuracy": 0.0, "repair_steps": 0.0}
+
+        optimizer = self._build_optimizer(
+            model,
+            lr=self.repair_lr,
+            optimizer_name=self.original_optimizer_name,
+            weight_decay=self.original_weight_decay,
+            momentum=self.original_momentum,
+        )
+        criterion = nn.CrossEntropyLoss()
+        last = {"repair_loss": 0.0, "repair_accuracy": 0.0, "repair_steps": 0.0}
+        for epoch in range(1, self.repair_epochs + 1):
+            model.train()
+            total_loss = 0.0
+            correct = 0
+            total = 0
+            steps = 0
+            for batch_idx, (x, y) in enumerate(retain_loader, start=1):
+                if self.repair_batches > 0 and batch_idx > self.repair_batches:
+                    break
+                x = x.to(self.device)
+                y = y.to(self.device)
+                optimizer.zero_grad()
+                logits = model(x)
+                loss = criterion(logits, y)
+                loss.backward()
+                self._maybe_clip_gradients(model)
+                optimizer.step()
+
+                batch_size = int(y.size(0))
+                total_loss += float(loss.item()) * batch_size
+                correct += int((logits.argmax(dim=1) == y).sum().item())
+                total += batch_size
+                steps += 1
+
+            last = {
+                "repair_loss": total_loss / max(total, 1),
+                "repair_accuracy": correct / max(total, 1),
+                "repair_steps": float(steps),
+            }
+            print(
+                f"[AMNESIAC][Repair {epoch:03d}/{self.repair_epochs:03d}] "
+                f"loss={last['repair_loss']:.6f} acc={last['repair_accuracy']:.4f} "
+                f"steps={int(last['repair_steps'])}"
+            )
+        return last
+
+    def _resolve_save_paths(self, dataset: UnlearningDataset, prefix: str) -> Tuple[Path, Path, Path]:
+        """
+        Resolve paths for trained checkpoint, unlearned checkpoint, and log file.
+
+        Args:
+            dataset: Dataset manager.
+            prefix: Method prefix for output names.
+
+        Returns:
+            Tuple of trained checkpoint, unlearned checkpoint, and update-log path.
+        """
+        model_name = str(self.config.get("model_name", "resnet18"))
+        target_tag = self._infer_target_tag()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        trained_root = Path(str(self.config.get("trained_weights_path", "save/weights/trained")))
+        trained_dir = trained_root.parent if trained_root.suffix else trained_root
+        trained_dir.mkdir(parents=True, exist_ok=True)
+        trained_path = trained_dir / f"amnesiac_logged_{model_name}_{dataset.dataset_name}_{target_tag}_{timestamp}.pt"
+
+        unlearned_root = Path(str(self.config.get("unlearned_weights_path", "save/weights/unlearned")))
+        unlearned_dir = unlearned_root.parent if unlearned_root.suffix else unlearned_root
+        unlearned_dir.mkdir(parents=True, exist_ok=True)
+        default_name = f"{prefix}_{model_name}_{dataset.dataset_name}_{target_tag}_{timestamp}.pt"
+        checkpoint_name = str(self.config.get("amnesiac_checkpoint_name", default_name))
+        unlearned_path = unlearned_dir / checkpoint_name
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.log_dir / f"amnesiac_log_{model_name}_{dataset.dataset_name}_{target_tag}_{timestamp}.pt"
+        return trained_path, unlearned_path, log_path
+
+    def _unlearn_with_update_log(self, dataset: UnlearningDataset) -> Dict:
+        """
+        Train an original model with forget-update logging and remove D_u updates.
+
+        Args:
+            dataset: Dataset manager exposing D_u, D_r, and D_test.
+
+        Returns:
+            Summary dictionary containing save paths, logs, and final metrics.
+        """
+        set_seed(int(self.config.get("seed", 42)))
+        loaders = dataset.get_dataloaders(retained_shuffle=True)
+        forget_loader = loaders["d_u"]
+        retain_loader = loaders["d_r"]
+        test_loader = loaders["d_test"]
+
+        model = self._build_model_from_config(dataset).to(self.device)
+        self.train_scope = "full"
+        self._set_train_scope(model)
+        optimizer = self._build_optimizer(
+            model,
+            lr=self.original_lr,
+            optimizer_name=self.original_optimizer_name,
+            weight_decay=self.original_weight_decay,
+            momentum=self.original_momentum,
+        )
+        delta_buffer = self._init_delta_buffer(model)
+        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        print("[AMNESIAC] ===== Start Log-Based Amnesiac Training =====")
+        print(
+            f"[AMNESIAC][Log] setup: model={self.config.get('model_name', 'resnet18')}, "
+            f"dataset={dataset.dataset_name}, device={self.device}, D_u={len(dataset.get_unlearning_set())}, "
+            f"D_r={len(dataset.get_retained_set())}, D_test={len(dataset.get_test_set())}"
+        )
+        print(
+            f"[AMNESIAC][Log] original_train: optimizer={self.original_optimizer_name}, "
+            f"lr={self.original_lr}, epochs={self.original_epochs}, "
+            f"weight_decay={self.original_weight_decay}, momentum={self.original_momentum}, "
+            f"logged_params={trainable_count}"
+        )
+
+        train_history = []
+        for epoch in range(1, self.original_epochs + 1):
+            stats = self._run_logged_train_epoch(
+                model=model,
+                retain_loader=retain_loader,
+                forget_loader=forget_loader,
+                optimizer=optimizer,
+                delta_buffer=delta_buffer,
+            )
+            test_eval = self._evaluate_split(model, test_loader, "test") if epoch % max(self.validate_every, 1) == 0 else {}
+            record = {"epoch": epoch, **stats}
+            if test_eval:
+                record["test_accuracy"] = test_eval["accuracy"]
+                record["test_loss"] = test_eval["loss"]
+            train_history.append(record)
+            print(
+                f"[AMNESIAC][Train {epoch:03d}/{self.original_epochs:03d}] "
+                f"retain_loss={stats['retain_train_loss']:.6f} "
+                f"retain_acc={stats['retain_train_accuracy']:.4f} "
+                f"forget_loss={stats['forget_train_loss']:.6f} "
+                f"forget_acc={stats['forget_train_accuracy']:.4f} "
+                f"test_acc={record.get('test_accuracy', 0.0):.4f}"
+            )
+
+        trained_path, save_path, log_path = self._resolve_save_paths(dataset, prefix="amnesiac_log")
+        model_name = str(self.config.get("model_name", "resnet18"))
+        manifest_path = dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+        manifest_info = dataset.get_forget_manifest_info() if hasattr(dataset, "get_forget_manifest_info") else None
+
+        trained_checkpoint = {
+            "state_dict": copy.deepcopy(model.state_dict()),
+            "method": "amnesiac_log_original_training",
+            "model_name": model_name,
+            "dataset": dataset.dataset_name,
+            "num_classes": int(self.config.get("num_classes", dataset.num_classes)),
+            "in_channels": int(self.config.get("in_channels", 3)),
+            "seed": int(self.config.get("seed", 42)),
+            "forget_manifest_path": manifest_path,
+            "forget_manifest": manifest_info,
+        }
+        torch.save(trained_checkpoint, str(trained_path))
+        torch.save(
+            {
+                "forget_delta": delta_buffer,
+                "method": "amnesiac_update_log",
+                "model_name": model_name,
+                "dataset": dataset.dataset_name,
+                "num_classes": int(self.config.get("num_classes", dataset.num_classes)),
+                "in_channels": int(self.config.get("in_channels", 3)),
+                "log_scale": self.log_scale,
+                "original_epochs": self.original_epochs,
+                "forget_manifest_path": manifest_path,
+                "forget_manifest": manifest_info,
+                "train_history": train_history,
+            },
+            str(log_path),
+        )
+        print(f"[AMNESIAC][Log] Saved trained original model to: {trained_path}")
+        print(f"[AMNESIAC][Log] Saved forget update log to: {log_path}")
+
+        self._apply_forget_delta(model, delta_buffer)
+        print(f"[AMNESIAC][Log] Removed logged forget updates with scale={self.log_scale}")
+        repair_stats = self._repair_on_retain(model, retain_loader)
+
+        forget_eval = self._evaluate_split(model, forget_loader, "forget")
+        retain_eval = self._evaluate_split(model, retain_loader, "retain")
+        test_eval = self._evaluate_split(model, test_loader, "test")
+        final_eval = {"forget": forget_eval, "retain": retain_eval, "test": test_eval}
+
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "method": "amnesiac_log",
+                "model_name": model_name,
+                "dataset": dataset.dataset_name,
+                "num_classes": int(self.config.get("num_classes", dataset.num_classes)),
+                "in_channels": int(self.config.get("in_channels", 3)),
+                "split_mode": self.config.get("split_mode", "random"),
+                "forget_classes": self.config.get("forget_classes", []),
+                "forget_ratio": self.config.get("forget_ratio", None),
+                "forget_count": self.config.get("forget_count", None),
+                "forget_manifest_path": manifest_path,
+                "forget_manifest": manifest_info,
+                "trained_path": str(trained_path),
+                "log_path": str(log_path),
+                "amnesiac_config": {
+                    "mode": "log",
+                    "original_epochs": self.original_epochs,
+                    "original_lr": self.original_lr,
+                    "original_optimizer": self.original_optimizer_name,
+                    "log_scale": self.log_scale,
+                    "repair_epochs": self.repair_epochs,
+                    "repair_lr": self.repair_lr,
+                    "repair_batches": self.repair_batches,
+                },
+                "final_eval": final_eval,
+                "repair_stats": repair_stats,
+                "seed": int(self.config.get("seed", 42)),
+            },
+            str(save_path),
+        )
+        summary_path = log_path.with_suffix(".json")
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "method": "amnesiac_log",
+                    "trained_path": str(trained_path),
+                    "unlearned_path": str(save_path),
+                    "log_path": str(log_path),
+                    "forget_manifest_path": manifest_path,
+                    "config": {
+                        "original_epochs": self.original_epochs,
+                        "original_lr": self.original_lr,
+                        "original_optimizer": self.original_optimizer_name,
+                        "log_scale": self.log_scale,
+                        "repair_epochs": self.repair_epochs,
+                        "repair_lr": self.repair_lr,
+                        "repair_batches": self.repair_batches,
+                    },
+                    "train_history": train_history,
+                    "repair_stats": repair_stats,
+                    "final_eval": final_eval,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"[AMNESIAC][Log] Saved unlearned model to: {save_path}")
+        print(f"[AMNESIAC][Log] Saved readable summary to: {summary_path}")
+        print("[AMNESIAC] ===== Log-Based Amnesiac Finished =====")
+
+        return {
+            "status": "ok",
+            "method": "amnesiac_log",
+            "model": model,
+            "save_path": str(save_path),
+            "trained_path": str(trained_path),
+            "log_path": str(log_path),
+            "summary_path": str(summary_path),
+            "history": train_history,
+            "final_eval": final_eval,
+            "repair_stats": repair_stats,
+            "forget_manifest_path": manifest_path,
+            "forget_manifest": manifest_info,
+        }
+
     def unlearn(self, model: Optional[nn.Module], dataset: UnlearningDataset) -> Dict:
         """
-        Execute Amnesiac relabel approximate unlearning.
+        Execute Amnesiac unlearning.
 
         Args:
             model: Optional original trained model.
@@ -731,6 +1194,13 @@ class AmnesiacUnlearner(BaseUnlearner):
         Returns:
             Summary dictionary containing the updated model and save path.
         """
+        if self.mode == "log":
+            if model is not None:
+                print("[AMNESIAC][Log] Ignoring provided model because log mode trains a logged original first.")
+            return self._unlearn_with_update_log(dataset)
+        if self.mode != "relabel":
+            raise ValueError(f"Unsupported Amnesiac mode: {self.mode}")
+
         set_seed(int(self.config.get("seed", 42)))
         loaders = dataset.get_dataloaders(retained_shuffle=True)
         relabel_loader = self._build_wrong_label_loader(dataset)

@@ -1,11 +1,11 @@
-"""End-to-end Amnesiac relabel approximate-unlearning runner.
+"""End-to-end Amnesiac unlearning runner.
 
 This script runs a complete Amnesiac experiment:
 1) Build D_u / D_r with the existing manifest mechanism
-2) Load the trained model from save/weights/trained
-3) Relabel D_u with deterministic wrong labels and continue training
-4) Save the unlearned checkpoint to save/weights/unlearned
-5) Print metrics for downstream RUV experiments
+2) In log mode, train a logged original model before unlearning
+3) Remove logged D_u updates, optionally repair on D_r
+4) In relabel mode, load an existing trained model and run wrong-label updates
+5) Save checkpoints/logs and print metrics for downstream RUV experiments
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def _build_args() -> argparse.Namespace:
     Returns:
         Parsed arguments.
     """
-    parser = argparse.ArgumentParser(description="Amnesiac relabel end-to-end test")
+    parser = argparse.ArgumentParser(description="Amnesiac end-to-end test")
     parser.add_argument("--config", type=str, default="configs/config.yaml")
     # Edit these defaults directly for the next Amnesiac run.
     parser.add_argument("--dataset", type=str, default="cifar10")
@@ -69,6 +69,20 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--unlearned-path", type=str, default="save/weights/unlearned")
     parser.add_argument("--save-name", type=str, default=None)
 
+    parser.add_argument("--mode", type=str, default="log", choices=["log", "relabel"])
+    parser.add_argument("--original-epochs", type=int, default=50)
+    parser.add_argument("--original-lr", type=float, default=0.01)
+    parser.add_argument("--original-optimizer", type=str, default="sgd", choices=["sgd", "adamw"])
+    parser.add_argument("--original-momentum", type=float, default=0.9)
+    parser.add_argument("--original-weight-decay", type=float, default=5e-4)
+    parser.add_argument("--log-dir", type=str, default="save/unlearning_logs/amnesiac")
+    parser.add_argument("--log-scale", type=float, default=1.0)
+    parser.add_argument("--repair-epochs", type=int, default=5)
+    parser.add_argument("--repair-lr", type=float, default=0.001)
+    parser.add_argument("--repair-batches", type=int, default=0)
+
+    # Relabel-mode parameters. These are ignored by mode=log except grad_clip
+    # and validate_every, which are shared by both paths.
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd"])
@@ -116,6 +130,17 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
             "trained_weights_path": args.trained_path,
             "unlearned_weights_path": args.unlearned_path,
             "device": args.device,
+            "amnesiac_mode": args.mode,
+            "amnesiac_original_epochs": args.original_epochs,
+            "amnesiac_original_lr": args.original_lr,
+            "amnesiac_original_optimizer": args.original_optimizer,
+            "amnesiac_original_momentum": args.original_momentum,
+            "amnesiac_original_weight_decay": args.original_weight_decay,
+            "amnesiac_log_dir": args.log_dir,
+            "amnesiac_log_scale": args.log_scale,
+            "amnesiac_repair_epochs": args.repair_epochs,
+            "amnesiac_repair_lr": args.repair_lr,
+            "amnesiac_repair_batches": args.repair_batches,
             "amnesiac_epochs": args.epochs,
             "amnesiac_lr": args.lr,
             "amnesiac_optimizer": args.optimizer,
@@ -198,6 +223,11 @@ def main() -> None:
 
     print("[AMNESIAC_TEST] ===== Amnesiac Completed =====")
     print(f"[AMNESIAC_TEST] Status: {result.get('status')}")
+    print(f"[AMNESIAC_TEST] Method: {result.get('method')}")
+    if result.get("trained_path"):
+        print(f"[AMNESIAC_TEST] Trained path: {result.get('trained_path')}")
+    if result.get("log_path"):
+        print(f"[AMNESIAC_TEST] Log path: {result.get('log_path')}")
     print(f"[AMNESIAC_TEST] Save path: {result.get('save_path')}")
     print(f"[AMNESIAC_TEST] Forget manifest path: {result.get('forget_manifest_path')}")
     print(f"[AMNESIAC_TEST] Epoch logs: {len(result.get('history', []))}")
