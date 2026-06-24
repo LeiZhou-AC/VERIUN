@@ -12,6 +12,7 @@ lr: 0.001
 epochs: 10
 alpha: 1.0
 "lambda": 0.5
+unlearning_method: odr
 
 ruv_distance: cosine
 ruv_metric: ras
@@ -32,6 +33,10 @@ ruv_arf_step_size: 0.007843137
 ruv_arf_steps: 5
 ruv_arf_distance: cosine
 ruv_arf_random_start: False
+ruv_m4_k: 1
+ruv_npg_k: 10
+ruv_multi_metrics: shift,ruler_m4,npg,ars
+ruv_multi_threshold: 2
 ruv_alpha: 0.05
 ruv_num_permutations: 100
 
@@ -49,3 +54,31 @@ amnesiac_validate_every: 1
 amnesiac_train_scope: full
 amnesiac_label_seed: 42
 amnesiac_label_strategy: cyclic
+
+salun_epochs: 10
+salun_lr: 0.013
+salun_optimizer: sgd
+salun_momentum: 0.9
+salun_weight_decay: 0.0005
+salun_mask_ratio: 0.5
+salun_mask_batches: 0
+salun_forget_weight: 1.0
+salun_retain_weight: 0.5
+salun_max_forget_batches: 0
+salun_max_retain_batches: 64
+salun_grad_clip: 5.0
+salun_validate_every: 1
+salun_train_scope: full
+salun_label_seed: 42
+salun_label_strategy: random_any
+
+ssd_selection_weighting: 10.0
+ssd_dampening_constant: 1.0
+ssd_min_scale: 0.0
+ssd_max_scale: 1.0
+ssd_exponent: 1.0
+ssd_original_split: all
+ssd_forget_batches: 0
+ssd_original_batches: 0
+ssd_retain_batches: 128
+ssd_epsilon: 0.000000000001

@@ -63,6 +63,12 @@ class RUVVerifier(BaseVerifier):
         self.arf_steps = int(self.config.get("ruv_arf_steps", 5))
         self.arf_distance = str(self.config.get("ruv_arf_distance", "cosine")).lower()
         self.arf_random_start = bool(self.config.get("ruv_arf_random_start", False))
+        self.m4_k = int(self.config.get("ruv_m4_k", 1))
+        self.npg_k = int(self.config.get("ruv_npg_k", 10))
+        self.multi_metrics = self._parse_layers(
+            self.config.get("ruv_multi_metrics", "shift,ruler_m4,npg,ars")
+        ) or ["shift", "ruler_m4", "npg", "ars"]
+        self.multi_threshold = int(self.config.get("ruv_multi_threshold", 2))
 
     def _parse_layers(self, raw_layers) -> Optional[List[str]]:
         """
@@ -1060,6 +1066,169 @@ class RUVVerifier(BaseVerifier):
             scores.append(np.mean(topk, axis=1))
         return np.concatenate(scores, axis=0)
 
+    def _topk_same_class_indices(
+        self,
+        query_features: np.ndarray,
+        query_labels: np.ndarray,
+        reference_features: np.ndarray,
+        reference_labels: np.ndarray,
+        k: int,
+        exclude_self: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Find same-class top-k retained neighbours for each query.
+
+        Args:
+            query_features: Query feature matrix.
+            query_labels: Query labels.
+            reference_features: Reference feature matrix.
+            reference_labels: Reference labels.
+            k: Number of same-class neighbours.
+            exclude_self: Whether query and reference are the same set and
+                self-matches should be excluded.
+
+        Returns:
+            Tuple of neighbour indices in the reference matrix and mean
+            top-k similarity per query.
+        """
+        query_norm = self._normalize_np(query_features)
+        reference_norm = self._normalize_np(reference_features)
+        query_labels = query_labels.astype(np.int64)
+        reference_labels = reference_labels.astype(np.int64)
+        k = max(1, int(k))
+
+        neighbour_indices = np.full((len(query_norm), k), -1, dtype=np.int64)
+        mean_similarities = np.zeros(len(query_norm), dtype=np.float64)
+        same_source = bool(exclude_self and len(query_norm) == len(reference_norm))
+
+        for label in np.unique(query_labels):
+            query_positions = np.where(query_labels == label)[0]
+            reference_positions = np.where(reference_labels == label)[0]
+            if len(reference_positions) == 0:
+                raise ValueError(f"No same-class reference samples for label={label}.")
+
+            sims = query_norm[query_positions] @ reference_norm[reference_positions].T
+            if same_source:
+                if len(reference_positions) < 2:
+                    raise ValueError(f"Need at least two same-class retained references for label={label}.")
+                local_lookup = {int(ref_idx): pos for pos, ref_idx in enumerate(reference_positions.tolist())}
+                for row, query_idx in enumerate(query_positions.tolist()):
+                    col = local_lookup.get(int(query_idx))
+                    if col is not None:
+                        sims[row, col] = -np.inf
+
+            k_eff = min(k, sims.shape[1])
+            if k_eff <= 0:
+                raise ValueError(f"No valid same-class neighbours for label={label}.")
+            if k_eff == sims.shape[1]:
+                top_local = np.tile(np.arange(sims.shape[1]), (sims.shape[0], 1))
+            else:
+                top_local = np.argpartition(sims, -k_eff, axis=1)[:, -k_eff:]
+            top_scores = np.take_along_axis(sims, top_local, axis=1)
+            top_reference = reference_positions[top_local]
+            if k_eff < k:
+                pad_width = k - k_eff
+                top_reference = np.pad(top_reference, ((0, 0), (0, pad_width)), constant_values=-1)
+
+            neighbour_indices[query_positions] = top_reference
+            mean_similarities[query_positions] = np.mean(top_scores, axis=1)
+
+        return neighbour_indices, mean_similarities
+
+    def _mean_similarity_to_fixed_indices(
+        self,
+        query_features: np.ndarray,
+        reference_features: np.ndarray,
+        neighbour_indices: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compute mean cosine similarity to fixed reference neighbours.
+
+        Args:
+            query_features: Query feature matrix.
+            reference_features: Reference feature matrix.
+            neighbour_indices: Reference indices per query.
+
+        Returns:
+            Mean fixed-neighbour similarity per query.
+        """
+        query_norm = self._normalize_np(query_features)
+        reference_norm = self._normalize_np(reference_features)
+        scores = np.zeros(len(query_norm), dtype=np.float64)
+        for row_idx, neighbours in enumerate(neighbour_indices):
+            valid = neighbours[neighbours >= 0]
+            if len(valid) == 0:
+                raise ValueError("NPG received a query without valid neighbours.")
+            sims = query_norm[row_idx : row_idx + 1] @ reference_norm[valid].T
+            scores[row_idx] = float(np.mean(sims))
+        return scores
+
+    def _percentile_rank_against_reference(self, values: np.ndarray, reference_values: np.ndarray) -> np.ndarray:
+        """
+        Convert similarities into percentile ranks against a calibration set.
+
+        Args:
+            values: Similarity values to rank.
+            reference_values: Calibration similarity distribution.
+
+        Returns:
+            Percentile ranks in [0, 1].
+        """
+        sorted_reference = np.sort(reference_values.astype(np.float64))
+        if len(sorted_reference) == 0:
+            raise ValueError("Cannot compute percentile ranks with an empty reference distribution.")
+        return np.searchsorted(sorted_reference, values, side="right") / float(len(sorted_reference))
+
+    def _evaluate_dynamic_drop(
+        self,
+        target_before: np.ndarray,
+        target_after: np.ndarray,
+        control_before: np.ndarray,
+        control_after: np.ndarray,
+        score_prefix: str,
+        positive_decision: str,
+        negative_decision: str,
+    ) -> Dict:
+        """
+        Evaluate target-specific drop in a before/after score.
+
+        Args:
+            target_before: D_u score under M_s.
+            target_after: D_u score under M_u.
+            control_before: D_r' score under M_s.
+            control_after: D_r' score under M_u.
+            score_prefix: Prefix for result field names.
+            positive_decision: Decision when rejected.
+            negative_decision: Decision when not rejected.
+
+        Returns:
+            Metric summary.
+        """
+        target_drop = target_before - target_after
+        control_drop = control_before - control_after
+        gap = self._compute_rug(target_drop, control_drop)
+        p_value = self._compute_p_value(target_drop, control_drop)
+        epsilon, null_gaps = self._permutation_test(target_drop, control_drop)
+        target_drop_p_value = self._safe_wilcoxon_greater(target_drop)
+        rejected = bool(p_value < self.alpha and gap > epsilon and np.mean(target_drop) > 0.0)
+        return {
+            f"{score_prefix}_before": self._summarize_scores(target_before),
+            f"{score_prefix}_after": self._summarize_scores(target_after),
+            f"{score_prefix}_drop": self._summarize_scores(target_drop),
+            f"control_{score_prefix}_before": self._summarize_scores(control_before),
+            f"control_{score_prefix}_after": self._summarize_scores(control_after),
+            f"control_{score_prefix}_drop": self._summarize_scores(control_drop),
+            f"{score_prefix}_gap": gap,
+            "p_value": p_value,
+            "target_drop_p_value": target_drop_p_value,
+            "epsilon": epsilon,
+            "rejected": rejected,
+            "decision": positive_decision if rejected else negative_decision,
+            "null_gap_mean": float(np.mean(null_gaps)) if null_gaps else None,
+            "null_gap_std": float(np.std(null_gaps)) if null_gaps else None,
+            "null_gap_quantile": epsilon,
+        }
+
     def _compute_rms_knn_scores(
         self,
         target_features: np.ndarray,
@@ -1182,6 +1351,350 @@ class RUVVerifier(BaseVerifier):
             "null_gap_std": float(np.std(null_gaps)) if null_gaps else None,
             "null_gap_quantile": epsilon,
         }
+
+    def _compute_m4_ranks(
+        self,
+        target_features: np.ndarray,
+        target_labels: np.ndarray,
+        retained_reference_features: np.ndarray,
+        retained_reference_labels: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute RULER-style M4 percentile ranks.
+
+        Args:
+            target_features: Target feature matrix.
+            target_labels: Target labels.
+            retained_reference_features: Retained reference feature matrix.
+            retained_reference_labels: Retained reference labels.
+
+        Returns:
+            Dict containing nearest-retain similarities, retained calibration
+            similarities, and percentile ranks.
+        """
+        _, target_similarity = self._topk_same_class_indices(
+            query_features=target_features,
+            query_labels=target_labels,
+            reference_features=retained_reference_features,
+            reference_labels=retained_reference_labels,
+            k=self.m4_k,
+            exclude_self=False,
+        )
+        _, calibration_similarity = self._topk_same_class_indices(
+            query_features=retained_reference_features,
+            query_labels=retained_reference_labels,
+            reference_features=retained_reference_features,
+            reference_labels=retained_reference_labels,
+            k=self.m4_k,
+            exclude_self=True,
+        )
+        ranks = self._percentile_rank_against_reference(target_similarity, calibration_similarity)
+        return {
+            "nearest_similarity": target_similarity,
+            "calibration_similarity": calibration_similarity,
+            "rank": ranks,
+        }
+
+    def verify_ruler_m4(self, model_before, model_after, dataset) -> Dict:
+        """
+        Run RULER-M4 oracle-free static geometry audit.
+
+        Args:
+            model_before: Source model M_s before unlearning.
+            model_after: Unlearned model M_u to verify.
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Verification summary dictionary.
+        """
+        if model_before is None:
+            raise ValueError("RULER-M4 requires model_before as the original trained model M_s.")
+        if model_after is None:
+            raise ValueError("RULER-M4 requires model_after as the unlearned model M_u.")
+
+        granularity, primary_layers, control_layers = self._resolve_layer_plan()
+        if self.primary_layers is None:
+            primary_layers = ["late"]
+        all_layers = self._deduplicate_layers(primary_layers + control_layers)
+        subsets = self._build_rms_knn_subsets(dataset)
+
+        print("[RUV][M4] ===== Start RULER-M4 Static Geometry Audit =====")
+        print(
+            f"[RUV][M4] Setup: granularity={granularity}, stages={all_layers}, "
+            f"k={self.m4_k}, D_u={len(subsets['forget_target'])}, "
+            f"D_r_control={len(subsets['retained_control'])}, "
+            f"D_r_ref={len(subsets['retained_reference'])}, permutations={self.num_permutations}"
+        )
+
+        print("[RUV][M4] Extracting M_s features...")
+        du_before, du_labels = self.extract_feature_label_dict(model_before, subsets["forget_target"], all_layers)
+        drc_before, drc_labels = self.extract_feature_label_dict(model_before, subsets["retained_control"], all_layers)
+        drr_before, drr_labels = self.extract_feature_label_dict(model_before, subsets["retained_reference"], all_layers)
+        print("[RUV][M4] Extracting M_u features...")
+        du_after, du_labels_after = self.extract_feature_label_dict(model_after, subsets["forget_target"], all_layers)
+        drc_after, drc_labels_after = self.extract_feature_label_dict(model_after, subsets["retained_control"], all_layers)
+        drr_after, drr_labels_after = self.extract_feature_label_dict(model_after, subsets["retained_reference"], all_layers)
+
+        for name, before_labels, after_labels in [
+            ("D_u", du_labels, du_labels_after),
+            ("D_r_control", drc_labels, drc_labels_after),
+            ("D_r_ref", drr_labels, drr_labels_after),
+        ]:
+            if not np.array_equal(before_labels, after_labels):
+                raise ValueError(f"Label order changed between M_s and M_u extraction for {name}.")
+
+        stage_results = {}
+        du_before_ranks = {}
+        du_after_ranks = {}
+        dr_before_ranks = {}
+        dr_after_ranks = {}
+        for layer in all_layers:
+            du_m4_before = self._compute_m4_ranks(du_before[layer], du_labels, drr_before[layer], drr_labels)
+            du_m4_after = self._compute_m4_ranks(du_after[layer], du_labels, drr_after[layer], drr_labels)
+            dr_m4_before = self._compute_m4_ranks(drc_before[layer], drc_labels, drr_before[layer], drr_labels)
+            dr_m4_after = self._compute_m4_ranks(drc_after[layer], drc_labels, drr_after[layer], drr_labels)
+
+            du_before_ranks[layer] = du_m4_before["rank"]
+            du_after_ranks[layer] = du_m4_after["rank"]
+            dr_before_ranks[layer] = dr_m4_before["rank"]
+            dr_after_ranks[layer] = dr_m4_after["rank"]
+            stage_results[layer] = self._evaluate_dynamic_drop(
+                target_before=du_m4_before["rank"],
+                target_after=du_m4_after["rank"],
+                control_before=dr_m4_before["rank"],
+                control_after=dr_m4_after["rank"],
+                score_prefix="m4_rank",
+                positive_decision="m4_rank_drop_detected",
+                negative_decision="no_target_specific_m4_rank_drop",
+            )
+            stage_results[layer]["m4_after_centered"] = float(np.mean(du_m4_after["rank"]) - 0.5)
+            print(
+                f"[RUV][M4][Stage:{layer}] "
+                f"rank_before={np.mean(du_m4_before['rank']):.6f} "
+                f"rank_after={np.mean(du_m4_after['rank']):.6f} "
+                f"control_drop={stage_results[layer]['control_m4_rank_drop']['mean']:.6f} "
+                f"gap={stage_results[layer]['m4_rank_gap']:.6f} "
+                f"p_value={stage_results[layer]['p_value']:.6g} "
+                f"epsilon={stage_results[layer]['epsilon']:.6f}"
+            )
+
+        primary_before = np.mean(np.stack([du_before_ranks[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_after = np.mean(np.stack([du_after_ranks[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_before = np.mean(np.stack([dr_before_ranks[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_after = np.mean(np.stack([dr_after_ranks[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_result = self._evaluate_dynamic_drop(
+            target_before=primary_before,
+            target_after=primary_after,
+            control_before=primary_control_before,
+            control_after=primary_control_after,
+            score_prefix="m4_rank",
+            positive_decision="m4_rank_drop_detected",
+            negative_decision="no_target_specific_m4_rank_drop",
+        )
+        m4_after_centered = float(np.mean(primary_after) - 0.5)
+        if m4_after_centered > 0.05:
+            static_state = "residual_memory_like"
+        elif m4_after_centered < -0.05:
+            static_state = "over_displacement_like"
+        else:
+            static_state = "retain_manifold_like"
+
+        result = {
+            "status": "ok",
+            "method": "ruler_m4",
+            "full_name": "RULER-M4 Static Geometry Audit",
+            "representation_name": "Retain-Manifold Percentile Rank",
+            "metric": "M4 Rank Drop Gap",
+            "granularity": granularity,
+            "primary_stages": primary_layers,
+            "control_stages": control_layers,
+            "m4_k": self.m4_k,
+            "m4_rank_gap": primary_result["m4_rank_gap"],
+            "m4_after_centered": m4_after_centered,
+            "static_state": static_state,
+            "p_value": primary_result["p_value"],
+            "target_drop_p_value": primary_result["target_drop_p_value"],
+            "epsilon": primary_result["epsilon"],
+            "alpha": self.alpha,
+            "rejected": primary_result["rejected"],
+            "decision": primary_result["decision"],
+            "interpretation": (
+                "D_u shows a target-specific drop in retain-manifold percentile rank."
+                if primary_result["rejected"]
+                else "No statistically significant target-specific M4 rank drop was detected."
+            ),
+            "m4_rank_before": primary_result["m4_rank_before"],
+            "m4_rank_after": primary_result["m4_rank_after"],
+            "m4_rank_drop": primary_result["m4_rank_drop"],
+            "control_m4_rank_before": primary_result["control_m4_rank_before"],
+            "control_m4_rank_after": primary_result["control_m4_rank_after"],
+            "control_m4_rank_drop": primary_result["control_m4_rank_drop"],
+            "stage_results": stage_results,
+            "num_forget": int(len(primary_before)),
+            "num_retained_control": int(len(primary_control_before)),
+            "rms_reference_size": len(subsets["retained_reference"]),
+            "num_permutations": self.num_permutations,
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+        }
+        print(
+            f"[RUV][M4][Primary] rank_before={result['m4_rank_before']['mean']:.6f} "
+            f"rank_after={result['m4_rank_after']['mean']:.6f} "
+            f"drop={result['m4_rank_drop']['mean']:.6f} "
+            f"control_drop={result['control_m4_rank_drop']['mean']:.6f} "
+            f"gap={result['m4_rank_gap']:.6f} p_value={result['p_value']:.6g} "
+            f"epsilon={result['epsilon']:.6f} state={result['static_state']}"
+        )
+        print(f"[RUV][M4] decision={result['decision']}")
+        print("[RUV][M4] ===== M4 Finished =====")
+        return result
+
+    def verify_npg(self, model_before, model_after, dataset) -> Dict:
+        """
+        Run fixed-neighbour Neighborhood Persistence Gap verification.
+
+        Args:
+            model_before: Source model M_s before unlearning.
+            model_after: Unlearned model M_u to verify.
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Verification summary dictionary.
+        """
+        if model_before is None:
+            raise ValueError("NPG requires model_before as the original trained model M_s.")
+        if model_after is None:
+            raise ValueError("NPG requires model_after as the unlearned model M_u.")
+
+        granularity, primary_layers, control_layers = self._resolve_layer_plan()
+        if self.primary_layers is None:
+            primary_layers = ["late"]
+        all_layers = self._deduplicate_layers(primary_layers + control_layers)
+        subsets = self._build_rms_knn_subsets(dataset)
+
+        print("[RUV][NPG] ===== Start Neighborhood Persistence Gap Verification =====")
+        print(
+            f"[RUV][NPG] Setup: granularity={granularity}, stages={all_layers}, "
+            f"k={self.npg_k}, D_u={len(subsets['forget_target'])}, "
+            f"D_r_control={len(subsets['retained_control'])}, "
+            f"D_r_ref={len(subsets['retained_reference'])}, permutations={self.num_permutations}"
+        )
+
+        print("[RUV][NPG] Extracting M_s features...")
+        du_before, du_labels = self.extract_feature_label_dict(model_before, subsets["forget_target"], all_layers)
+        drc_before, drc_labels = self.extract_feature_label_dict(model_before, subsets["retained_control"], all_layers)
+        drr_before, drr_labels = self.extract_feature_label_dict(model_before, subsets["retained_reference"], all_layers)
+        print("[RUV][NPG] Extracting M_u features...")
+        du_after, du_labels_after = self.extract_feature_label_dict(model_after, subsets["forget_target"], all_layers)
+        drc_after, drc_labels_after = self.extract_feature_label_dict(model_after, subsets["retained_control"], all_layers)
+        drr_after, drr_labels_after = self.extract_feature_label_dict(model_after, subsets["retained_reference"], all_layers)
+
+        for name, before_labels, after_labels in [
+            ("D_u", du_labels, du_labels_after),
+            ("D_r_control", drc_labels, drc_labels_after),
+            ("D_r_ref", drr_labels, drr_labels_after),
+        ]:
+            if not np.array_equal(before_labels, after_labels):
+                raise ValueError(f"Label order changed between M_s and M_u extraction for {name}.")
+
+        stage_results = {}
+        du_before_scores = {}
+        du_after_scores = {}
+        dr_before_scores = {}
+        dr_after_scores = {}
+        for layer in all_layers:
+            du_neighbours, du_sim_before = self._topk_same_class_indices(
+                du_before[layer], du_labels, drr_before[layer], drr_labels, k=self.npg_k
+            )
+            dr_neighbours, dr_sim_before = self._topk_same_class_indices(
+                drc_before[layer], drc_labels, drr_before[layer], drr_labels, k=self.npg_k
+            )
+            du_sim_after = self._mean_similarity_to_fixed_indices(du_after[layer], drr_after[layer], du_neighbours)
+            dr_sim_after = self._mean_similarity_to_fixed_indices(drc_after[layer], drr_after[layer], dr_neighbours)
+
+            du_before_scores[layer] = du_sim_before
+            du_after_scores[layer] = du_sim_after
+            dr_before_scores[layer] = dr_sim_before
+            dr_after_scores[layer] = dr_sim_after
+            stage_results[layer] = self._evaluate_dynamic_drop(
+                target_before=du_sim_before,
+                target_after=du_sim_after,
+                control_before=dr_sim_before,
+                control_after=dr_sim_after,
+                score_prefix="npg_similarity",
+                positive_decision="neighborhood_persistence_loss_detected",
+                negative_decision="no_target_specific_neighborhood_loss",
+            )
+            print(
+                f"[RUV][NPG][Stage:{layer}] "
+                f"drop={stage_results[layer]['npg_similarity_drop']['mean']:.6f} "
+                f"control_drop={stage_results[layer]['control_npg_similarity_drop']['mean']:.6f} "
+                f"gap={stage_results[layer]['npg_similarity_gap']:.6f} "
+                f"p_value={stage_results[layer]['p_value']:.6g} "
+                f"epsilon={stage_results[layer]['epsilon']:.6f}"
+            )
+
+        primary_before = np.mean(np.stack([du_before_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_after = np.mean(np.stack([du_after_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_before = np.mean(np.stack([dr_before_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_control_after = np.mean(np.stack([dr_after_scores[layer] for layer in primary_layers], axis=0), axis=0)
+        primary_result = self._evaluate_dynamic_drop(
+            target_before=primary_before,
+            target_after=primary_after,
+            control_before=primary_control_before,
+            control_after=primary_control_after,
+            score_prefix="npg_similarity",
+            positive_decision="neighborhood_persistence_loss_detected",
+            negative_decision="no_target_specific_neighborhood_loss",
+        )
+
+        result = {
+            "status": "ok",
+            "method": "npg",
+            "full_name": "Neighborhood Persistence Gap",
+            "representation_name": "Fixed Retained Neighbourhood",
+            "metric": "NPG Similarity Drop Gap",
+            "granularity": granularity,
+            "primary_stages": primary_layers,
+            "control_stages": control_layers,
+            "npg_k": self.npg_k,
+            "npg_similarity_gap": primary_result["npg_similarity_gap"],
+            "p_value": primary_result["p_value"],
+            "target_drop_p_value": primary_result["target_drop_p_value"],
+            "epsilon": primary_result["epsilon"],
+            "alpha": self.alpha,
+            "rejected": primary_result["rejected"],
+            "decision": primary_result["decision"],
+            "interpretation": (
+                "D_u shows target-specific loss of fixed retained-neighbour persistence."
+                if primary_result["rejected"]
+                else "No statistically significant target-specific neighbourhood persistence loss was detected."
+            ),
+            "npg_similarity_before": primary_result["npg_similarity_before"],
+            "npg_similarity_after": primary_result["npg_similarity_after"],
+            "npg_similarity_drop": primary_result["npg_similarity_drop"],
+            "control_npg_similarity_before": primary_result["control_npg_similarity_before"],
+            "control_npg_similarity_after": primary_result["control_npg_similarity_after"],
+            "control_npg_similarity_drop": primary_result["control_npg_similarity_drop"],
+            "stage_results": stage_results,
+            "num_forget": int(len(primary_before)),
+            "num_retained_control": int(len(primary_control_before)),
+            "rms_reference_size": len(subsets["retained_reference"]),
+            "num_permutations": self.num_permutations,
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+        }
+        print(
+            f"[RUV][NPG][Primary] drop={result['npg_similarity_drop']['mean']:.6f} "
+            f"control_drop={result['control_npg_similarity_drop']['mean']:.6f} "
+            f"gap={result['npg_similarity_gap']:.6f} p_value={result['p_value']:.6g} "
+            f"epsilon={result['epsilon']:.6f}"
+        )
+        print(f"[RUV][NPG] decision={result['decision']}")
+        print("[RUV][NPG] ===== NPG Finished =====")
+        return result
 
     def _augment_tensor_batch(self, x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         """
@@ -1624,6 +2137,80 @@ class RUVVerifier(BaseVerifier):
         print("[RUV][RMS-kNN] ===== RMS-kNN Finished =====")
         return result
 
+    def verify_multi_audit(self, model_before, model_after, dataset) -> Dict:
+        """
+        Run two-model multi-view representation audit.
+
+        Args:
+            model_before: Source model M_s before unlearning.
+            model_after: Unlearned model M_u to verify.
+            dataset: UnlearningDataset instance.
+
+        Returns:
+            Multi-view audit summary.
+        """
+        metrics = self._deduplicate_layers(self.multi_metrics)
+        if not metrics:
+            raise ValueError("ruv_multi_metrics must contain at least one metric.")
+
+        print("[RUV][MULTI] ===== Start Multi-View Representation Audit =====")
+        print(
+            f"[RUV][MULTI] metrics={metrics}, threshold={self.multi_threshold}, "
+            f"alpha={self.alpha}, permutations={self.num_permutations}"
+        )
+
+        metric_results = {}
+        rejected_metrics = []
+        for metric in metrics:
+            normalized = str(metric).lower()
+            if normalized in {"multi_audit", "multi", "multi_view", "multi-view"}:
+                raise ValueError("ruv_multi_metrics cannot include multi_audit itself.")
+            sub_config = dict(self.config)
+            sub_config["ruv_metric"] = normalized
+            sub_verifier = RUVVerifier(config=sub_config)
+            print(f"[RUV][MULTI] Running sub-metric: {normalized}")
+            result = sub_verifier.verify(model_before=model_before, model_after=model_after, dataset=dataset)
+            metric_results[normalized] = result
+            if bool(result.get("rejected", False)):
+                rejected_metrics.append(normalized)
+
+        evidence_count = len(rejected_metrics)
+        threshold = max(1, self.multi_threshold)
+        accepted = evidence_count >= threshold
+        result = {
+            "status": "ok",
+            "method": "multi_audit",
+            "full_name": "Two-Model Multi-View Representation Audit",
+            "representation_name": "Multi-View Representation Evidence",
+            "metric": "Retain-Normalized Evidence Count",
+            "metrics": metrics,
+            "evidence_count": evidence_count,
+            "evidence_threshold": threshold,
+            "rejected_metrics": rejected_metrics,
+            "rejected": accepted,
+            "decision": (
+                "multi_view_unlearning_evidence_detected"
+                if accepted
+                else "insufficient_multi_view_unlearning_evidence"
+            ),
+            "interpretation": (
+                "Multiple representation views support target-specific unlearning evidence."
+                if accepted
+                else "The configured representation views do not provide enough target-specific evidence."
+            ),
+            "metric_results": metric_results,
+            "forget_manifest_path": (
+                dataset.get_forget_manifest_path() if hasattr(dataset, "get_forget_manifest_path") else None
+            ),
+        }
+        print(
+            f"[RUV][MULTI] evidence_count={evidence_count}/{len(metrics)} "
+            f"threshold={threshold} rejected_metrics={rejected_metrics}"
+        )
+        print(f"[RUV][MULTI] decision={result['decision']}")
+        print("[RUV][MULTI] ===== Multi-View Audit Finished =====")
+        return result
+
     def verify(self, model_before, model_after, dataset):
         """
         Run Representation Update Verification.
@@ -1648,6 +2235,12 @@ class RUVVerifier(BaseVerifier):
             return self.verify_ars(model_before, model_after, dataset)
         if self.metric in {"arf", "adversarial_fragility", "adv_fragility", "representation_fragility"}:
             return self.verify_arf(model_before, model_after, dataset)
+        if self.metric in {"ruler_m4", "m4", "ruler-m4", "static_geometry"}:
+            return self.verify_ruler_m4(model_before, model_after, dataset)
+        if self.metric in {"npg", "neighborhood_persistence", "neighbourhood_persistence"}:
+            return self.verify_npg(model_before, model_after, dataset)
+        if self.metric in {"multi_audit", "multi", "multi_view", "multi-view"}:
+            return self.verify_multi_audit(model_before, model_after, dataset)
 
         granularity, primary_layers, control_layers = self._resolve_layer_plan()
         all_layers = self._deduplicate_layers(primary_layers + control_layers)

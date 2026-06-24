@@ -68,6 +68,26 @@ Class-conditioned sample split:
 python ODR_test.py --dataset cifar10 --model-name resnet18 --split-mode class_random --forget-classes 0 --forget-ratio 0.1 --forget-manifest-mode save
 ```
 
+## Unified Unlearning Entry
+
+All implemented unlearning methods can also be launched through the common
+factory entry:
+
+```bash
+python scripts/unlearn.py \
+  --method salun \
+  --dataset cifar10 \
+  --model-name resnet18 \
+  --split-mode random \
+  --forget-ratio 0.01 \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/default_forget_manifest.json \
+  --trained-path save/weights/trained/resnet18_cifar10.pt \
+  --unlearned-path save/weights/unlearned
+```
+
+Supported methods: `odr`, `odr_gate`, `retrain`, `amnesiac`, `salun`, `ssd`.
+
 ## Amnesiac Test
 
 Amnesiac is the approximate target-unlearning baseline used in the current
@@ -127,6 +147,67 @@ python RUV_test.py \
   --forget-manifest-path save/manifests/default_forget_manifest.json
 ```
 
+## SalUn Test
+
+SalUn is the gradient-saliency baseline. The implementation first builds a
+forget-set saliency mask from CE gradients, then performs masked wrong-label
+updates on `D_u` and masked retained-data updates on `D_r`.
+By default it follows the official classification branch more closely:
+saliency is computed from the `-CE(D_u)` gradient, replacement labels use
+`random_any`, and mask-out weights are restored after each optimizer step.
+
+```bash
+python SALUN_test.py \
+  --dataset cifar10 \
+  --model-name resnet18 \
+  --split-mode random \
+  --forget-ratio 0.01 \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/default_forget_manifest.json \
+  --mask-ratio 0.5 \
+  --label-strategy random_any
+```
+
+Class-level SalUn:
+
+```bash
+python SALUN_test.py \
+  --dataset cifar10 \
+  --model-name resnet18 \
+  --split-mode by_class \
+  --forget-classes 0 \
+  --mask-ratio 0.5
+```
+
+## SSD Test
+
+SSD is the post-hoc parameter-importance baseline. It estimates squared-gradient
+importance on `D_u` and `D_all`, selects parameters where forget importance
+dominates retained importance, and dampens those parameters directly.
+
+```bash
+python SSD_test.py \
+  --dataset cifar10 \
+  --model-name resnet18 \
+  --split-mode random \
+  --forget-ratio 0.01 \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/default_forget_manifest.json \
+  --selection-weighting 10.0 \
+  --dampening-constant 1.0 \
+  --original-split all
+```
+
+Class-level SSD:
+
+```bash
+python SSD_test.py \
+  --dataset cifar10 \
+  --model-name resnet18 \
+  --split-mode by_class \
+  --forget-classes 0
+```
+
 ARS activation-route verification can be selected with:
 
 ```bash
@@ -155,3 +236,23 @@ python RUV_test.py \
   --forget-manifest-mode load \
   --forget-manifest-path save/manifests/default_forget_manifest.json
 ```
+
+Two-model multi-view representation audit combines static geometry and dynamic
+transition evidence:
+
+```bash
+python RUV_test.py \
+  --ruv-metric multi_audit \
+  --ruv-mode sample \
+  --ruv-layers late \
+  --ruv-control-layers stem \
+  --multi-metrics shift,ruler_m4,npg,ars \
+  --multi-threshold 2 \
+  --unlearned-model-path save/weights/unlearned/<checkpoint>.pt \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/default_forget_manifest.json
+```
+
+`ruler_m4` is an oracle-free retain-manifold percentile-rank diagnostic, and
+`npg` tracks whether fixed retained neighbours from the original model remain
+neighbours after unlearning.
