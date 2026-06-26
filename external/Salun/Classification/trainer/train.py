@@ -131,3 +131,21 @@ def train(train_loader, model, criterion, optimizer, epoch, args, mask=None, l1=
         print("train_accuracy {top1.avg:.3f}".format(top1=top1))
 
     return top1.avg
+
+
+def train_with_rewind(model, optimizer, scheduler, train_loader, criterion, args):
+    """
+    Compatibility helper expected by the official pruning utilities.
+
+    Some SalUn checkouts import ``train_with_rewind`` from this module even
+    though the function is absent in the bundled file.  The standard CIFAR
+    SalUn workflow does not call it, but defining it keeps the official package
+    importable and preserves pruning behavior when needed.
+    """
+    rewind_state_dict = copy.deepcopy(model.state_dict())
+    for epoch in range(0, args.epochs):
+        train(train_loader, model, criterion, optimizer, epoch, args)
+        scheduler.step()
+        if int(getattr(args, "rewind_epoch", 0)) > 0 and epoch + 1 == int(args.rewind_epoch):
+            rewind_state_dict = copy.deepcopy(model.state_dict())
+    return rewind_state_dict
