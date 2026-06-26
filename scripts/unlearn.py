@@ -46,7 +46,7 @@ def _build_args() -> argparse.Namespace:
         "--method",
         type=str,
         default=None,
-        choices=["odr", "odr_gate", "retrain", "amnesiac", "salun", "ssd"],
+        choices=["odr", "odr_gate", "retrain", "amnesiac", "ssd"],
     )
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=None)

@@ -190,6 +190,7 @@ class UnlearningDataset:
             "forget_classes": [int(x) for x in self.forget_classes],
             "du_indices": [int(x) for x in du_indices],
             "dr_indices": [int(x) for x in dr_indices],
+            "ignored_indices": [],
         }
 
     def _save_manifest(self, payload: Dict) -> None:
@@ -246,13 +247,20 @@ class UnlearningDataset:
 
         du_indices = [int(x) for x in payload.get("du_indices", [])]
         dr_indices = [int(x) for x in payload.get("dr_indices", [])]
+        ignored_indices = [int(x) for x in payload.get("ignored_indices", [])]
         if not du_indices or not dr_indices:
             raise ValueError("Manifest contains empty D_u or D_r.")
-        if len(set(du_indices).intersection(set(dr_indices))) > 0:
+        du_set = set(du_indices)
+        dr_set = set(dr_indices)
+        ignored_set = set(ignored_indices)
+        if du_set.intersection(dr_set):
             raise ValueError("Manifest contains overlapping indices between D_u and D_r.")
-        if len(du_indices) + len(dr_indices) != total_size:
+        if du_set.intersection(ignored_set) or dr_set.intersection(ignored_set):
+            raise ValueError("Manifest contains ignored indices overlapping D_u or D_r.")
+        if len(du_indices) + len(dr_indices) + len(ignored_indices) != total_size:
             raise ValueError(
-                "Manifest index count mismatch: len(D_u)+len(D_r) must equal len(D_all)."
+                "Manifest index count mismatch: "
+                "len(D_u)+len(D_r)+len(ignored_indices) must equal len(D_all)."
             )
         return du_indices, dr_indices
 

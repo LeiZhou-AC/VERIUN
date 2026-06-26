@@ -4,7 +4,6 @@ from unlearning.od import ODRUnlearner
 from unlearning.odr_gate import ODRGateUnlearner
 from unlearning.retrain import RetrainUnlearner
 from unlearning.amnesiac import AmnesiacUnlearner
-from unlearning.salun import SalUnUnlearner
 from unlearning.ssd import SSDUnlearner
 
 
@@ -17,7 +16,6 @@ def get_unlearner(name: str, config):
     - odr_gate
     - retrain
     - amnesiac
-    - salun
     - ssd
     - finetune (reserved)
 
@@ -41,8 +39,6 @@ def get_unlearner(name: str, config):
         return RetrainUnlearner(config)
     if normalized_name in {"amnesiac", "amnesiac_relabel", "amnesiac-relabel"}:
         return AmnesiacUnlearner(config)
-    if normalized_name in {"salun", "saliency_unlearning", "saliency-unlearning"}:
-        return SalUnUnlearner(config)
     if normalized_name in {"ssd", "selective_synaptic_dampening", "selective-synaptic-dampening"}:
         return SSDUnlearner(config)
     if normalized_name == "finetune":

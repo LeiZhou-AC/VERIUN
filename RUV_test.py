@@ -24,6 +24,7 @@ import torch
 
 from configs.data.dataset import UnlearningDataset
 from configs.models.resnet import construct_model
+from configs.models.salun_resnet import construct_salun_official_model
 from utils.config import load_config
 from utils.seed import set_seed
 from verification.ruv import RUVVerifier
@@ -72,6 +73,7 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default="configs/config.yaml")
     parser.add_argument("--dataset", type=str, default="cifar10")
     parser.add_argument("--model-name", type=str, default="resnet18")
+    parser.add_argument("--model-backend", type=str, default="native", choices=["native", "salun_official"])
     parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--in-channels", type=int, default=3)
     parser.add_argument("--data-path", type=str, default="datasets")
@@ -145,6 +147,7 @@ def _merge_config(base_config: dict, args: argparse.Namespace) -> dict:
         {
             "dataset": args.dataset,
             "model_name": args.model_name,
+            "model_backend": args.model_backend,
             "num_classes": args.num_classes,
             "in_channels": args.in_channels,
             "data_path": args.data_path,
@@ -223,9 +226,18 @@ def _resolve_checkpoint(path_value: str, config: dict, role: str) -> Path:
     if exact_path.is_file():
         return exact_path
 
-    candidates = sorted(path.glob("*.pt")) + sorted(path.glob("*.pth")) + sorted(path.glob("*.bin"))
+    candidates = (
+        sorted(path.glob("*.pt"))
+        + sorted(path.glob("*.pth"))
+        + sorted(path.glob("*.pth.tar"))
+        + sorted(path.glob("*.bin"))
+    )
+    candidates = [candidate for candidate in candidates if "eval_result" not in candidate.name]
     if not candidates:
         raise FileNotFoundError(f"No checkpoint found under: {path}")
+    checkpoint_candidates = [candidate for candidate in candidates if "checkpoint" in candidate.name]
+    if checkpoint_candidates:
+        return checkpoint_candidates[-1]
     return candidates[-1]
 
 
@@ -262,12 +274,19 @@ def _load_model(config: dict, dataset: UnlearningDataset, checkpoint_path: Path,
     Returns:
         Loaded model.
     """
-    model, _ = construct_model(
-        model=str(config.get("model_name", "resnet18")),
-        num_classes=int(config.get("num_classes", dataset.num_classes)),
-        seed=int(config.get("seed", 42)),
-        num_channels=int(config.get("in_channels", 3)),
-    )
+    backend = str(config.get("model_backend", "native")).lower()
+    if backend == "salun_official":
+        model = construct_salun_official_model(
+            model=str(config.get("model_name", "resnet18")),
+            num_classes=int(config.get("num_classes", dataset.num_classes)),
+        )
+    else:
+        model, _ = construct_model(
+            model=str(config.get("model_name", "resnet18")),
+            num_classes=int(config.get("num_classes", dataset.num_classes)),
+            seed=int(config.get("seed", 42)),
+            num_channels=int(config.get("in_channels", 3)),
+        )
     state = torch.load(str(checkpoint_path), map_location="cpu")
     missing, unexpected = model.load_state_dict(_extract_state_dict(state), strict=False)
     print(f"[RUV_TEST] Loaded {label} checkpoint: {checkpoint_path}")
@@ -315,6 +334,9 @@ def main() -> None:
 
     if config["device"] == "cuda" and not torch.cuda.is_available():
         config["device"] = "cpu"
+    if str(config.get("model_backend", "native")).lower() == "salun_official":
+        config["normalize"] = False
+        print("[RUV_TEST] model_backend=salun_official, using raw ToTensor inputs because official SalUn ResNet normalizes internally.")
 
     set_seed(int(config.get("seed", 42)))
     print("[RUV_TEST] ===== Pipeline Configuration =====")

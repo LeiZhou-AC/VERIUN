@@ -75,7 +75,7 @@ factory entry:
 
 ```bash
 python scripts/unlearn.py \
-  --method salun \
+  --method ssd \
   --dataset cifar10 \
   --model-name resnet18 \
   --split-mode random \
@@ -86,7 +86,9 @@ python scripts/unlearn.py \
   --unlearned-path save/weights/unlearned
 ```
 
-Supported methods: `odr`, `odr_gate`, `retrain`, `amnesiac`, `salun`, `ssd`.
+Supported internal methods: `odr`, `odr_gate`, `retrain`, `amnesiac`, `ssd`.
+Official SalUn is run through `tools/run_salun_official.py` instead of the
+internal unlearning factory.
 
 ## Amnesiac Test
 
@@ -147,36 +149,45 @@ python RUV_test.py \
   --forget-manifest-path save/manifests/default_forget_manifest.json
 ```
 
-## SalUn Test
+## Official SalUn Workflow
 
-SalUn is the gradient-saliency baseline. The implementation first builds a
-forget-set saliency mask from CE gradients, then performs masked wrong-label
-updates on `D_u` and masked retained-data updates on `D_r`.
-By default it follows the official classification branch more closely:
-saliency is computed from the `-CE(D_u)` gradient, replacement labels use
-`random_any`, and mask-out weights are restored after each optimizer step.
+SalUn is evaluated through the official Classification implementation under
+`external/salun/Classification`. The project runner keeps the official code
+untouched while using this workspace's `datasets/` and `save/` directories.
 
 ```bash
-python SALUN_test.py \
+python tools/run_salun_official.py \
+  --stage all \
   --dataset cifar10 \
-  --model-name resnet18 \
-  --split-mode random \
-  --forget-ratio 0.01 \
-  --forget-manifest-mode load \
-  --forget-manifest-path save/manifests/default_forget_manifest.json \
-  --mask-ratio 0.5 \
-  --label-strategy random_any
+  --arch resnet18 \
+  --data-path datasets \
+  --gpu 0 \
+  --seed 2 \
+  --train-seed 1 \
+  --batch-size 256 \
+  --num-indexes-to-replace 4500 \
+  --train-epochs 182 \
+  --train-lr 0.1 \
+  --unlearn-epochs 10 \
+  --unlearn-lr 0.013 \
+  --mask-ratio 0.5
 ```
 
-Class-level SalUn:
+Verify the official SalUn checkpoint with the SalUn backend:
 
 ```bash
-python SALUN_test.py \
-  --dataset cifar10 \
+python RUV_test.py \
+  --model-backend salun_official \
   --model-name resnet18 \
-  --split-mode by_class \
-  --forget-classes 0 \
-  --mask-ratio 0.5
+  --dataset cifar10 \
+  --data-path datasets \
+  --split-mode random \
+  --forget-manifest-mode load \
+  --forget-manifest-path save/manifests/salun_official_random_4500.json \
+  --original-model-path save/weights/trained/salun_official_original/0checkpoint.pth.tar \
+  --unlearned-model-path save/weights/unlearned/salun_official_random4500/RLcheckpoint.pth.tar \
+  --ruv-metric multi_audit \
+  --ruv-mode sample
 ```
 
 ## SSD Test
