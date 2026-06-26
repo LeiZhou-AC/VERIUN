@@ -7,8 +7,11 @@ dataset paths, manifest export, checkpoint locations, and command order.
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List
 
@@ -55,6 +58,11 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--manifest-path", type=str, default="save/manifests/salun_official_random_4500.json")
     parser.add_argument("--model-path", type=str, default="")
     parser.add_argument("--mask-path", type=str, default="")
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove selected SalUn output directories before running the requested stages.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -89,6 +97,35 @@ def _run(cmd: List[str], cwd: Path, dry_run: bool) -> None:
     if dry_run:
         return
     subprocess.run(cmd, cwd=str(cwd), check=True)
+
+
+def _safe_clean_dir(path: Path) -> None:
+    """
+    Remove an output directory only when it is inside the project root.
+
+    Args:
+        path: Directory to remove.
+    """
+    resolved = path.resolve()
+    project = PROJECT_ROOT.resolve()
+    if project not in [resolved, *resolved.parents]:
+        raise ValueError(f"Refusing to clean path outside project root: {resolved}")
+    if resolved.exists():
+        print(f"[SALUN_RUNNER] clean: {resolved}")
+        shutil.rmtree(resolved)
+
+
+def _assert_file(path: Path, label: str) -> None:
+    """
+    Fail fast when an expected SalUn artifact is missing.
+
+    Args:
+        path: Expected file path.
+        label: Human-readable artifact name.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {label}: {path}")
+    print(f"[SALUN_RUNNER] verified {label}: {path}")
 
 
 def _common_salun_args(args: argparse.Namespace) -> List[str]:
@@ -189,7 +226,6 @@ def _mask_cmd(args: argparse.Namespace) -> List[str]:
     Returns:
         Command token list.
     """
-    model_path = _resolve_model_path(args)
     return [
         args.python,
         "generate_mask.py",
@@ -197,7 +233,7 @@ def _mask_cmd(args: argparse.Namespace) -> List[str]:
         "--save_dir",
         str(_abs_path(args.mask_dir)),
         "--model_path",
-        str(model_path),
+        str(_resolve_model_path(args)),
         "--num_indexes_to_replace",
         str(args.num_indexes_to_replace),
         "--unlearn_epochs",
@@ -268,29 +304,98 @@ def _resolve_mask_path(args: argparse.Namespace) -> Path:
     return _abs_path(args.mask_dir) / f"with_{args.mask_ratio}.pt"
 
 
+def _write_run_metadata(args: argparse.Namespace, stages: List[str]) -> None:
+    """
+    Save a lightweight provenance file for the official SalUn run.
+
+    Args:
+        args: Runner args.
+        stages: Stages requested in this invocation.
+    """
+    payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "project_root": str(PROJECT_ROOT),
+        "salun_classification_dir": str(SALUN_CLASSIFICATION_DIR),
+        "stages": stages,
+        "dataset": args.dataset,
+        "arch": args.arch,
+        "seed": args.seed,
+        "train_seed": args.train_seed,
+        "batch_size": args.batch_size,
+        "num_indexes_to_replace": args.num_indexes_to_replace,
+        "train_epochs": args.train_epochs,
+        "train_lr": args.train_lr,
+        "decreasing_lr": args.decreasing_lr,
+        "unlearn_method": args.unlearn_method,
+        "unlearn_epochs": args.unlearn_epochs,
+        "unlearn_lr": args.unlearn_lr,
+        "mask_ratio": args.mask_ratio,
+        "manifest_path": str(_abs_path(args.manifest_path)),
+        "original_checkpoint": str(_resolve_model_path(args)),
+        "mask_path": str(_resolve_mask_path(args)),
+        "unlearn_checkpoint": str(_abs_path(args.unlearn_save_dir) / (args.unlearn_method + "checkpoint.pth.tar")),
+        "eval_result": str(_abs_path(args.unlearn_save_dir) / (args.unlearn_method + "eval_result.pth.tar")),
+    }
+    metadata_path = _abs_path(args.unlearn_save_dir) / "salun_runner_metadata.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[SALUN_RUNNER] metadata: {metadata_path}")
+
+
 def main() -> None:
     """Run selected official SalUn workflow stages."""
     args = _build_args()
     if not SALUN_CLASSIFICATION_DIR.exists():
         raise FileNotFoundError(f"Official SalUn Classification directory not found: {SALUN_CLASSIFICATION_DIR}")
 
+    stages = ["manifest", "train", "mask", "unlearn"] if args.stage == "all" else [args.stage]
+    if args.clean and not args.dry_run:
+        if "train" in stages:
+            _safe_clean_dir(_abs_path(args.original_save_dir))
+        if "mask" in stages:
+            _safe_clean_dir(_abs_path(args.mask_dir))
+        if "unlearn" in stages:
+            _safe_clean_dir(_abs_path(args.unlearn_save_dir))
+
     _abs_path(args.original_save_dir).mkdir(parents=True, exist_ok=True)
     _abs_path(args.mask_dir).mkdir(parents=True, exist_ok=True)
     _abs_path(args.unlearn_save_dir).mkdir(parents=True, exist_ok=True)
     _abs_path(args.manifest_path).parent.mkdir(parents=True, exist_ok=True)
 
-    stages = ["manifest", "train", "mask", "unlearn"] if args.stage == "all" else [args.stage]
     for stage in stages:
         if stage == "manifest":
             _run(_manifest_cmd(args), cwd=PROJECT_ROOT, dry_run=args.dry_run)
+            if not args.dry_run:
+                _assert_file(_abs_path(args.manifest_path), "VeriUn manifest")
         elif stage == "train":
             _run(_train_cmd(args), cwd=SALUN_CLASSIFICATION_DIR, dry_run=args.dry_run)
+            if not args.dry_run:
+                _assert_file(_resolve_model_path(args), "original checkpoint")
         elif stage == "mask":
+            if not args.dry_run:
+                _assert_file(_resolve_model_path(args), "original checkpoint for mask generation")
             _run(_mask_cmd(args), cwd=SALUN_CLASSIFICATION_DIR, dry_run=args.dry_run)
+            if not args.dry_run:
+                _assert_file(_resolve_mask_path(args), "SalUn mask")
         elif stage == "unlearn":
+            if not args.dry_run:
+                _assert_file(_resolve_model_path(args), "original checkpoint for unlearning")
+                _assert_file(_resolve_mask_path(args), "SalUn mask for unlearning")
             _run(_unlearn_cmd(args), cwd=SALUN_CLASSIFICATION_DIR, dry_run=args.dry_run)
+            if not args.dry_run:
+                _assert_file(
+                    _abs_path(args.unlearn_save_dir) / (args.unlearn_method + "checkpoint.pth.tar"),
+                    "unlearned checkpoint",
+                )
+                _assert_file(
+                    _abs_path(args.unlearn_save_dir) / (args.unlearn_method + "eval_result.pth.tar"),
+                    "unlearn eval result",
+                )
         else:
             raise ValueError(f"Unsupported stage: {stage}")
+
+    if not args.dry_run:
+        _write_run_metadata(args, stages)
 
     print("[SALUN_RUNNER] Finished.")
     print(f"[SALUN_RUNNER] manifest: {_abs_path(args.manifest_path)}")
