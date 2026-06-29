@@ -191,7 +191,7 @@ def _load_model(path: Path, config: Dict, allow_partial_load: bool):
 
 @torch.inference_mode()
 def _evaluate(model, dataloader, device: torch.device) -> Dict:
-    """Measure accuracy, confidence, loss, and per-class accuracy on D_u."""
+    """Measure accuracy, confidence, loss, and per-class accuracy on a dataset."""
     model.to(device)
     model.eval()
     total = 0
@@ -253,25 +253,43 @@ def main() -> None:
     device = torch.device(device_name)
 
     dataset = UnlearningDataset(config)
-    forget_loader = dataset.get_dataloaders(retained_shuffle=False)["d_u"]
+    dataloaders = dataset.get_dataloaders(retained_shuffle=False)
+    forget_loader = dataloaders["d_u"]
+    retain_loader = dataloaders["d_r"]
     paths = _checkpoint_files(args.model_paths or DEFAULT_MODEL_PATHS)
 
-    print("[FORGET_ACC] ===== Forget-Set Accuracy Evaluation =====")
+    print("[FORGET_ACC] ===== Forget/Retain Accuracy Evaluation =====")
     print(f"[FORGET_ACC] Manifest: {manifest_path}")
-    print(f"[FORGET_ACC] D_u size: {len(dataset.get_unlearning_set())}")
+    print(
+        f"[FORGET_ACC] D_u size: {len(dataset.get_unlearning_set())}, "
+        f"D_r size: {len(dataset.get_retained_set())}"
+    )
     print(f"[FORGET_ACC] Backend: {config['model_backend']}, model: {config['model_name']}")
 
     results = []
     for checkpoint_path in paths:
         print(f"[FORGET_ACC] Loading: {checkpoint_path}")
         model = _load_model(checkpoint_path, config, args.allow_partial_load)
-        metrics = _evaluate(model, forget_loader, device)
-        results.append({"checkpoint": str(checkpoint_path), **metrics})
+        forget_metrics = _evaluate(model, forget_loader, device)
+        retain_metrics = _evaluate(model, retain_loader, device)
+        results.append(
+            {
+                "checkpoint": str(checkpoint_path),
+                "forget": forget_metrics,
+                "retain": retain_metrics,
+            }
+        )
         print(
-            f"[FORGET_ACC] accuracy={metrics['accuracy']:.4f} "
-            f"({metrics['correct']}/{metrics['total']}) "
-            f"confidence={metrics['mean_true_label_confidence']:.4f} "
-            f"ce={metrics['mean_cross_entropy']:.4f}"
+            f"[FORGET_ACC][Forget] accuracy={forget_metrics['accuracy']:.4f} "
+            f"({forget_metrics['correct']}/{forget_metrics['total']}) "
+            f"confidence={forget_metrics['mean_true_label_confidence']:.4f} "
+            f"ce={forget_metrics['mean_cross_entropy']:.4f}"
+        )
+        print(
+            f"[FORGET_ACC][Retain] accuracy={retain_metrics['accuracy']:.4f} "
+            f"({retain_metrics['correct']}/{retain_metrics['total']}) "
+            f"confidence={retain_metrics['mean_true_label_confidence']:.4f} "
+            f"ce={retain_metrics['mean_cross_entropy']:.4f}"
         )
         del model
 
