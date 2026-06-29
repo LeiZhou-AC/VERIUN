@@ -124,11 +124,12 @@ def main():
     if args.resume and checkpoint is not None:
         model, evaluation_result = checkpoint
     else:
-        checkpoint = torch.load(args.model_path, map_location=device)
-        if "state_dict" in checkpoint.keys():
-            checkpoint = checkpoint["state_dict"]
-
         if args.unlearn != "retrain":
+            if not args.model_path:
+                raise ValueError("--model_path is required for non-retrain methods")
+            checkpoint = torch.load(args.model_path, map_location=device)
+            if "state_dict" in checkpoint.keys():
+                checkpoint = checkpoint["state_dict"]
             model.load_state_dict(checkpoint, strict=False)
 
         unlearn_method = unlearn.get_unlearn_method(args.unlearn)
