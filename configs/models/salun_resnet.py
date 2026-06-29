@@ -18,7 +18,24 @@ import torch.nn.functional as F
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SALUN_RESNET_PATH = PROJECT_ROOT / "external" / "salun" / "Classification" / "models" / "ResNet.py"
+SALUN_RESNET_CANDIDATES = (
+    PROJECT_ROOT / "external" / "Salun" / "Classification" / "models" / "ResNet.py",
+    PROJECT_ROOT / "external" / "salun" / "Classification" / "models" / "ResNet.py",
+)
+
+
+def _resolve_salun_resnet_path() -> Path:
+    """
+    Resolve the official SalUn ResNet source across case-sensitive filesystems.
+
+    Returns:
+        Existing official ResNet source path.
+    """
+    for path in SALUN_RESNET_CANDIDATES:
+        if path.is_file():
+            return path
+    searched = ", ".join(str(path) for path in SALUN_RESNET_CANDIDATES)
+    raise FileNotFoundError(f"Official SalUn ResNet implementation not found. Searched: {searched}")
 
 
 def _load_salun_resnet_module():
@@ -28,14 +45,10 @@ def _load_salun_resnet_module():
     Returns:
         Imported Python module.
     """
-    if not SALUN_RESNET_PATH.exists():
-        raise FileNotFoundError(
-            "Official SalUn ResNet implementation not found: "
-            f"{SALUN_RESNET_PATH}"
-        )
-    spec = importlib.util.spec_from_file_location("salun_official_resnet", SALUN_RESNET_PATH)
+    salun_resnet_path = _resolve_salun_resnet_path()
+    spec = importlib.util.spec_from_file_location("salun_official_resnet", salun_resnet_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load SalUn ResNet module: {SALUN_RESNET_PATH}")
+        raise ImportError(f"Unable to load SalUn ResNet module: {salun_resnet_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

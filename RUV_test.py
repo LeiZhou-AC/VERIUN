@@ -288,12 +288,9 @@ def _load_model(config: dict, dataset: UnlearningDataset, checkpoint_path: Path,
             num_channels=int(config.get("in_channels", 3)),
         )
     state = torch.load(str(checkpoint_path), map_location="cpu")
-    missing, unexpected = model.load_state_dict(_extract_state_dict(state), strict=False)
+    model.load_state_dict(_extract_state_dict(state), strict=True)
     print(f"[RUV_TEST] Loaded {label} checkpoint: {checkpoint_path}")
-    if missing:
-        print(f"[RUV_TEST][Load][{label}] Missing keys count: {len(missing)}")
-    if unexpected:
-        print(f"[RUV_TEST][Load][{label}] Unexpected keys count: {len(unexpected)}")
+    print(f"[RUV_TEST][Load][{label}] State dict matched exactly.")
     return model
 
 
