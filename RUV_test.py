@@ -261,6 +261,25 @@ def _extract_state_dict(state_obj):
     return {k[len("module."):] if k.startswith("module.") else k: v for k, v in state_obj.items()}
 
 
+def _load_checkpoint(path: Path):
+    """
+    Load a trusted local checkpoint across PyTorch versions.
+
+    SalUn checkpoints include NumPy-based evaluation metadata, which cannot be
+    deserialized by the weights-only loader enabled by default in PyTorch 2.6.
+
+    Args:
+        path: Local checkpoint path.
+
+    Returns:
+        Deserialized checkpoint object.
+    """
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location="cpu")
+
+
 def _load_model(config: dict, dataset: UnlearningDataset, checkpoint_path: Path, label: str):
     """
     Load a model from checkpoint.
@@ -287,7 +306,7 @@ def _load_model(config: dict, dataset: UnlearningDataset, checkpoint_path: Path,
             seed=int(config.get("seed", 42)),
             num_channels=int(config.get("in_channels", 3)),
         )
-    state = torch.load(str(checkpoint_path), map_location="cpu")
+    state = _load_checkpoint(checkpoint_path)
     model.load_state_dict(_extract_state_dict(state), strict=True)
     print(f"[RUV_TEST] Loaded {label} checkpoint: {checkpoint_path}")
     print(f"[RUV_TEST][Load][{label}] State dict matched exactly.")
